@@ -6,6 +6,7 @@ import os
 from datetime import date, datetime, time
 
 from calculos import calcular_comissao_os
+from tempos_fixos import carregar_tabela_tempos, formatar_horas, NENHUM_COMPONENTE
 
 # ─────────────────────────────────────────────
 #  TABELA DE FROTAS
@@ -257,6 +258,16 @@ input, textarea, select,
     margin-top: 0.1rem;
 }
 .timeline-content { flex: 1; }
+
+.tempo-fixo-box {
+    background: linear-gradient(135deg, #052e2e 0%, #0a3d3d 100%);
+    border: 1px solid #0e7490;
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+    color: #67e8f9 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -398,9 +409,19 @@ def _recalc_preview():
     tec_info   = TECNICOS.get(cod_tec, {})
     valor_hora = TABELA_HORA.get(tec_info.get("nivel", "Técnico Um"), 50)
     km_rodado  = max(0.0, km_f - km_i)
-    horas_trab = (datetime.combine(date.today(), h_c) -
-                  datetime.combine(date.today(), h_s)).seconds / 3600
-    horas_mun  = max(0.0, m_f - m_i)
+    horas_munck  = max(0.0, m_f - m_i)
+
+    # ── Tempo fixo por componente (se aplicável) ──
+    tabela_tempos, _ = carregar_tabela_tempos()
+    equip_fixo = st.session_state.get("_pr_equip_fixo", NENHUM_COMPONENTE)
+    comp_fixo  = st.session_state.get("_pr_componente_fixo", NENHUM_COMPONENTE)
+    tempo_fixo_aplicado = (equip_fixo != NENHUM_COMPONENTE and comp_fixo != NENHUM_COMPONENTE)
+
+    if tempo_fixo_aplicado:
+        horas_trab = tabela_tempos.get((equip_fixo, comp_fixo), 0.0)
+    else:
+        horas_trab = (datetime.combine(date.today(), h_c) -
+                      datetime.combine(date.today(), h_s)).seconds / 3600
 
     est = calcular_comissao_os(
         local_servico=local,
@@ -408,9 +429,9 @@ def _recalc_preview():
         valor_hora=valor_hora,
         km_rodado=km_rodado,
         tipo_km=tec_info.get("tipo_km", "Km Um"),
-        horas_munck=horas_mun,
+        horas_munck=horas_munck,
     )
-    return est, horas_trab, km_rodado, horas_mun
+    return est, horas_trab, km_rodado, horas_munck, tempo_fixo_aplicado
 
 # ─────────────────────────────────────────────
 #  FORMULÁRIO DE SERVIÇO
@@ -446,6 +467,7 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
         st.session_state["_pr_mun_fim"]    = float(e.get("hora_munck_final",   0))
         st.session_state["_pr_hora_saida"] = _pt(e.get("hora_saida"),   time(7,  30))
         st.session_state["_pr_hora_cheg"]  = _pt(e.get("hora_chegada"), time(16, 30))
+        st.session_state["_pr_equip_fixo"] = e.get("equipamento_tempo_fixo") or NENHUM_COMPONENTE
         st.session_state["_pr_reset"] = False
 
     # Cabeçalho da OS
@@ -491,6 +513,51 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
 
     st.markdown("---")
 
+    # ── Tempo Fixo por Componente (opcional) ──
+    st.markdown("##### ⏱️ Tempo Fixo por Componente (opcional)")
+    st.caption(
+        "Se este serviço é a troca/reparo de um componente da tabela, o tempo já vem "
+        "pronto da planilha e o campo Hora Saída/Chegada abaixo não é usado no cálculo. "
+        "Se não for um item da tabela, o tempo continua sendo calculado por hora início/fim."
+    )
+    tabela_tempos, por_equipamento = carregar_tabela_tempos()
+
+    if not por_equipamento:
+        st.warning("⚠️ Planilha TEMPO_SERVIÇO.xlsx não encontrada na pasta do app — "
+                    "tempo fixo indisponível, todos os serviços usam hora início/fim.")
+        equip_sel, comp_sel = NENHUM_COMPONENTE, NENHUM_COMPONENTE
+    else:
+        equipamentos_tabela = [NENHUM_COMPONENTE] + sorted(por_equipamento.keys())
+        if st.session_state.get("_pr_equip_fixo") not in equipamentos_tabela:
+            st.session_state["_pr_equip_fixo"] = NENHUM_COMPONENTE
+
+        c_eq, c_comp = st.columns(2)
+        equip_sel = c_eq.selectbox("Equipamento (tabela de tempos)", equipamentos_tabela,
+                                    key="_pr_equip_fixo")
+
+        if equip_sel != NENHUM_COMPONENTE:
+            comps = [NENHUM_COMPONENTE] + por_equipamento.get(equip_sel, [])
+        else:
+            comps = [NENHUM_COMPONENTE]
+        if st.session_state.get("_pr_componente_fixo") not in comps:
+            st.session_state["_pr_componente_fixo"] = (
+                e.get("componente_tempo_fixo") if e.get("componente_tempo_fixo") in comps
+                else NENHUM_COMPONENTE
+            )
+        comp_sel = c_comp.selectbox("Componente", comps, key="_pr_componente_fixo",
+                                     disabled=(equip_sel == NENHUM_COMPONENTE))
+
+        if equip_sel != NENHUM_COMPONENTE and comp_sel != NENHUM_COMPONENTE:
+            horas_fixas = tabela_tempos.get((equip_sel, comp_sel), 0.0)
+            st.markdown(f"""
+            <div class="tempo-fixo-box">
+                ⏱️ <strong>Tempo fixo aplicado: {horas_fixas:.2f}h ({formatar_horas(horas_fixas)})</strong><br>
+                Hora Saída/Chegada abaixo servem apenas de registro — não entram no cálculo.
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
     # ── Linha 2 ──
     c4, c5 = st.columns(2)
     with c4:
@@ -508,7 +575,7 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
 
     # ── Preview ──
     st.markdown("---")
-    comissao_est, horas_trab, km_rodado, horas_munck = _recalc_preview()
+    comissao_est, horas_trab, km_rodado, horas_munck, tempo_fixo_aplicado = _recalc_preview()
 
     if eh_tecnico:
         st.markdown(f"""
@@ -516,7 +583,7 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             <div class="title">📊 Resumo</div>
             <div class="preview-grid-2">
                 <div class="preview-item">
-                    <div class="lbl">Horas Trabalhadas</div>
+                    <div class="lbl">{"Horas (tempo fixo)" if tempo_fixo_aplicado else "Horas Trabalhadas"}</div>
                     <div class="val">{horas_trab:.2f}h</div>
                 </div>
                 <div class="preview-item">
@@ -532,7 +599,7 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             <div class="title">📊 Preview da Comissão</div>
             <div class="preview-grid">
                 <div class="preview-item">
-                    <div class="lbl">Horas</div>
+                    <div class="lbl">{"Horas (fixo)" if tempo_fixo_aplicado else "Horas"}</div>
                     <div class="val">{horas_trab:.2f}h</div>
                 </div>
                 <div class="preview-item">
@@ -561,7 +628,10 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             st.error("A descrição do serviço é obrigatória.")
             return None
         if horas_trab <= 0:
-            st.error("Hora chegada deve ser posterior à hora saída.")
+            if tempo_fixo_aplicado:
+                st.error("Não foi possível obter o tempo fixo para este componente.")
+            else:
+                st.error("Hora chegada deve ser posterior à hora saída.")
             return None
 
         serv = {
@@ -574,6 +644,9 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             "hora_saida":          str(hora_saida),
             "hora_chegada":        str(hora_chegada),
             "horas_trabalhadas":   round(horas_trab, 4),
+            "equipamento_tempo_fixo": equip_sel if equip_sel != NENHUM_COMPONENTE else None,
+            "componente_tempo_fixo":  comp_sel  if comp_sel  != NENHUM_COMPONENTE else None,
+            "tempo_fixo_aplicado":    tempo_fixo_aplicado,
             "km_inicial":          km_ini,
             "km_final":            km_fim,
             "km_rodado":           round(km_rodado, 2),
@@ -609,7 +682,8 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
 
         # Limpa session_state do form
         for k in ["_pr_km_ini","_pr_km_fim","_pr_mun_ini","_pr_mun_fim",
-                  "_pr_hora_saida","_pr_hora_cheg","_pr_cod_tecnico","_pr_local"]:
+                  "_pr_hora_saida","_pr_hora_cheg","_pr_cod_tecnico","_pr_local",
+                  "_pr_equip_fixo","_pr_componente_fixo"]:
             st.session_state.pop(k, None)
         st.session_state["_pr_reset"] = True
         return serv
@@ -628,13 +702,18 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
     eh_tecnico = ud["perfil"] == "tecnico"
 
     for p in servs:
+        tempo_fixo_txt = ""
+        if p.get("tempo_fixo_aplicado"):
+            tempo_fixo_txt = (
+                f" &nbsp;·&nbsp; ⏱️ Tempo fixo: <strong>{p.get('componente_tempo_fixo','?')}</strong>"
+            )
         c_left, c_right = st.columns([3, 1])
         with c_left:
             st.markdown(f"""
             <div class="serv-card">
                 <div class="serv-seq">Serviço #{p.get('seq','?')}</div>
                 <div class="serv-tec">{p.get('nome_tecnico','?')} <span style="color:#64748b;font-size:0.78rem;">— {p.get('nivel_tecnico','?')}</span></div>
-                <div class="serv-tipo">{p.get('tipo_servico','?')} &nbsp;·&nbsp; {p.get('local_servico','?')} &nbsp;·&nbsp; {p.get('data','?')}</div>
+                <div class="serv-tipo">{p.get('tipo_servico','?')} &nbsp;·&nbsp; {p.get('local_servico','?')} &nbsp;·&nbsp; {p.get('data','?')}{tempo_fixo_txt}</div>
                 <div style="margin-top:0.5rem;font-size:0.82rem;color:#cbd5e1;">
                     <strong>Horário:</strong> {p.get('hora_saida','?')} → {p.get('hora_chegada','?')}
                     &nbsp;|&nbsp; <strong>Horas:</strong> {float(p.get('horas_trabalhadas',0)):.2f}h
@@ -1317,6 +1396,8 @@ def pagina_exportar():
                 "Nivel":          p.get("nivel_tecnico",""),
                 "Tipo Servico":   p.get("tipo_servico",""),
                 "Local":          p.get("local_servico",""),
+                "Componente Tempo Fixo": p.get("componente_tempo_fixo","") or "",
+                "Tempo Fixo Aplicado":   "Sim" if p.get("tempo_fixo_aplicado") else "Não",
                 "Hora Saida":     p.get("hora_saida",""),
                 "Hora Chegada":   p.get("hora_chegada",""),
                 "Horas Trab":     float(p.get("horas_trabalhadas",0)),
@@ -1378,7 +1459,7 @@ def pagina_configuracoes():
     st.markdown("""<div class="section-header">
         <span style="font-size:1.3rem">⚙️</span><h3>Configurações do Sistema</h3>
     </div>""", unsafe_allow_html=True)
-    tab1, tab2 = st.tabs(["Tabela de Valores", "Técnicos"])
+    tab1, tab2, tab3 = st.tabs(["Tabela de Valores", "Técnicos", "Tempos Fixos por Componente"])
     with tab1:
         st.markdown("**KM Rodado**")
         st.dataframe(pd.DataFrame([{"Tipo KM":k,"R$/km":v} for k,v in TABELA_KM.items()]), hide_index=True)
@@ -1392,6 +1473,17 @@ def pagina_configuracoes():
              "KM":v["tipo_km"],"R$/hora":TABELA_HORA.get(v["nivel"],50)}
             for k,v in TECNICOS.items()
         ]), use_container_width=True, hide_index=True)
+    with tab3:
+        tabela_tempos, _ = carregar_tabela_tempos()
+        if not tabela_tempos:
+            st.warning("Planilha TEMPO_SERVIÇO.xlsx não encontrada na pasta do app.")
+        else:
+            st.caption("1 dia útil = 8,8h (jornada semanal de 44h em 5 dias, 7h–17h com 1h12 de almoço).")
+            st.dataframe(pd.DataFrame([
+                {"Equipamento": eq, "Componente": comp, "Tempo Fixo (h)": round(h, 2),
+                 "Tempo Fixo": formatar_horas(h)}
+                for (eq, comp), h in sorted(tabela_tempos.items())
+            ]), use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────
 #  MAIN
