@@ -282,6 +282,7 @@ from dados import (
     carregar_os, criar_os,
     adicionar_procedimento as adicionar_servico,
     editar_procedimento    as editar_servico,
+    excluir_procedimento   as excluir_servico,
     fechar_os_para_aprovacao,
     reabrir_os, validar_os, buscar_os_por_numero,
     # compat
@@ -753,13 +754,42 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
                     eh_meu                 # técnico só edita o próprio
                 )
                 if pode_editar_serv:
-                    if st.button(f"✏️ Editar", key=f"edit_serv_{p.get('proc_id','')}"):
-                        st.session_state["_editando_serv"] = {
-                            "numero_os": os_item["numero_os"],
-                            "serv":      p,
-                        }
-                        st.session_state["_pr_reset"] = True
-                        st.rerun()
+                    bc1, bc2 = st.columns(2) if ud["perfil"] == "admin" else (st.container(), None)
+                    with bc1:
+                        if st.button(f"✏️ Editar", key=f"edit_serv_{p.get('proc_id','')}"):
+                            st.session_state["_editando_serv"] = {
+                                "numero_os": os_item["numero_os"],
+                                "serv":      p,
+                            }
+                            st.session_state["_pr_reset"] = True
+                            st.rerun()
+
+                    # Botão excluir — somente admin
+                    if ud["perfil"] == "admin":
+                        confirm_key = f"_confirm_excl_{p.get('proc_id','')}"
+                        with bc2:
+                            if st.session_state.get(confirm_key):
+                                if st.button("✅ Confirmar", key=f"conf_excl_{p.get('proc_id','')}"):
+                                    ok = excluir_servico(
+                                        os_item["numero_os"],
+                                        p.get("proc_id", ""),
+                                        st.session_state["usuario"],
+                                    )
+                                    st.session_state.pop(confirm_key, None)
+                                    if ok:
+                                        st.success("Serviço excluído!")
+                                    else:
+                                        st.error("Não foi possível excluir o serviço.")
+                                    st.rerun()
+                            else:
+                                if st.button("🗑️ Excluir", key=f"del_serv_{p.get('proc_id','')}"):
+                                    st.session_state[confirm_key] = True
+                                    st.rerun()
+                        if st.session_state.get(confirm_key):
+                            st.caption("⚠️ Confirma a exclusão deste serviço? Essa ação não pode ser desfeita.")
+                            if st.button("✖️ Cancelar exclusão", key=f"canc_excl_{p.get('proc_id','')}"):
+                                st.session_state.pop(confirm_key, None)
+                                st.rerun()
 
 # ─────────────────────────────────────────────
 #  PÁGINA: ABRIR NOVA OS

@@ -412,6 +412,38 @@ def editar_procedimento(numero_os: str, proc_id: str, proc_atualizado: dict) -> 
             return True
     return False
 
+def excluir_procedimento(numero_os: str, proc_id: str, excluido_por: str) -> bool:
+    """
+    Remove um serviço (por proc_id) de uma OS em aberta/em_andamento.
+    Controle de acesso (apenas admin) é feito na camada de UI (app.py).
+    Renumera os 'seq' restantes e, se a OS ficar sem serviços,
+    volta o status para 'aberta'.
+    """
+    sp_id, os_dict = _fetch_by_numero(numero_os)
+    if not sp_id:
+        return False
+    if os_dict["status"] not in ("aberta", "em_andamento"):
+        return False
+    procs = os_dict.get("procedimentos", [])
+    restantes = [p for p in procs if p.get("proc_id") != proc_id]
+    if len(restantes) == len(procs):
+        return False   # proc_id não encontrado
+
+    for i, p in enumerate(restantes, start=1):
+        p["seq"] = i
+    os_dict["procedimentos"] = restantes
+    if not restantes:
+        os_dict["status"] = "aberta"
+
+    os_dict.setdefault("historico_exclusao", []).append({
+        "proc_id":      proc_id,
+        "excluido_por": excluido_por,
+        "excluido_em":  datetime.now().isoformat(),
+    })
+    _patch(sp_id, os_dict)
+    carregar_os.clear()
+    return True
+
 def fechar_os_para_aprovacao(numero_os: str, fechado_por: str) -> bool:
     """Muda status: em_andamento → aguardando_aprovacao."""
     sp_id, os_dict = _fetch_by_numero(numero_os)
