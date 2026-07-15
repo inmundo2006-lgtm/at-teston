@@ -229,6 +229,9 @@ def _headers() -> dict:
     return {
         "Authorization": f"Bearer {_get_token()}",
         "Content-Type":  "application/json",
+        # Necessário para $filter em colunas não indexadas (ex: fields/Title).
+        # Sem isso o Graph pode retornar 400 Bad Request de forma intermitente.
+        "Prefer": "HonorNonIndexedQueriesWarningMayFailRandomly",
     }
 
 # ── Helpers internos ────────────────────────────────────────────
@@ -248,13 +251,24 @@ def _parse_item(item: dict) -> dict | None:
     except Exception:
         return None
 
+def _raise_com_detalhe(r: requests.Response) -> None:
+    """Levanta HTTPError mostrando o motivo real retornado pelo Graph API,
+    em vez de deixar a mensagem genérica do Streamlit Cloud esconder tudo."""
+    if not r.ok:
+        try:
+            detalhe = r.json().get("error", {}).get("message", r.text[:300])
+        except Exception:
+            detalhe = r.text[:300]
+        st.error(f"Graph API — erro {r.status_code}: {detalhe}")
+    r.raise_for_status()
+
 def _fetch_all() -> list[dict]:
     """Busca todos os itens da lista com paginação automática."""
     url = _base_url() + "?$expand=fields&$top=999"
     items = []
     while url:
         r = requests.get(url, headers=_headers(), timeout=20)
-        r.raise_for_status()
+        _raise_com_detalhe(r)
         data = r.json()
         for item in data.get("value", []):
             parsed = _parse_item(item)
@@ -270,7 +284,7 @@ def _fetch_by_numero(numero_os: str) -> tuple[str | None, dict | None]:
         + f"?$expand=fields&$filter=fields/Title eq '{numero_os}'"
     )
     r = requests.get(url, headers=_headers(), timeout=15)
-    r.raise_for_status()
+    _raise_com_detalhe(r)
     items = r.json().get("value", [])
     if not items:
         return None, None
@@ -287,7 +301,7 @@ def _patch(sp_item_id: str, os_dict: dict) -> None:
         "Status":  os_dict.get("status", ""),
     }
     r = requests.patch(url, headers=_headers(), json=payload, timeout=15)
-    r.raise_for_status()
+    _raise_com_detalhe(r)
 
 def _post(os_dict: dict) -> str:
     """Cria novo item e retorna o sp_item_id."""
@@ -300,7 +314,7 @@ def _post(os_dict: dict) -> str:
         }
     }
     r = requests.post(_base_url(), headers=_headers(), json=payload, timeout=15)
-    r.raise_for_status()
+    _raise_com_detalhe(r)
     return r.json()["id"]
 
 def _gerar_numero_os() -> str:
