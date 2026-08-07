@@ -285,6 +285,7 @@ from dados import (
     excluir_procedimento   as excluir_servico,
     fechar_os_para_aprovacao,
     reabrir_os, validar_os, buscar_os_por_numero,
+    definir_tecnico_designado,
     # compat
     salvar_os, atualizar_status_os, editar_os,
 )
@@ -824,6 +825,14 @@ def pagina_abrir_os():
             placeholder="Será preenchido automaticamente ao digitar a frota",
         )
 
+        lista_tec_nomes = {v["nome"]: k for k, v in TECNICOS.items()}
+        nome_tec_sel = st.selectbox(
+            "Técnico Responsável",
+            list(lista_tec_nomes.keys()),
+            help="Apenas este técnico verá esta OS para lançar serviços e encerrá-la.",
+        )
+        cod_tecnico_sel = lista_tec_nomes[nome_tec_sel]
+
         if st.form_submit_button("🚀 Abrir OS", type="primary", use_container_width=True):
             if not frota:
                 st.error("Informe a frota.")
@@ -834,6 +843,7 @@ def pagina_abrir_os():
                     cod_cc=cod_cc,
                     aberto_por=st.session_state["usuario"],
                     data_abertura=str(data_ab),
+                    tecnico_designado=cod_tecnico_sel,
                 )
                 st.success(f"✅ OS **{nova['numero_os']}** criada com sucesso!")
                 st.balloons()
@@ -848,8 +858,11 @@ def pagina_abrir_os():
                     <div style="font-size:0.85rem;color:#6ee7b7;margin-top:0.25rem;">
                         Frota {frota} · {CENTROS_CUSTO[cod_cc]}
                     </div>
+                    <div style="font-size:0.85rem;color:#6ee7b7;margin-top:0.15rem;">
+                        Técnico responsável: {nome_tec_sel}
+                    </div>
                     <div style="font-size:0.78rem;color:#4a7c59;margin-top:0.5rem;">
-                        Informe este número aos técnicos para adicionar serviços.
+                        Apenas {nome_tec_sel} verá esta OS para lançar serviços.
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -898,6 +911,18 @@ def pagina_adicionar_servico():
             st.session_state.pop("_serv_numero_os", None)
             st.rerun()
             return
+
+        # Trava de segurança: técnico só acessa OS designada a ele
+        # (ou legada, sem designação).
+        if ud["perfil"] == "tecnico":
+            tec_desig = os_item.get("tecnico_designado")
+            if tec_desig not in (None, ud.get("cod_tecnico")):
+                st.error("🚫 Esta OS está designada a outro técnico. Você não pode lançar serviços nela.")
+                st.session_state.pop("_serv_os_carregada", None)
+                st.session_state.pop("_serv_numero_os", None)
+                if st.button("← Voltar para lista de OS"):
+                    st.rerun()
+                return
 
         if st.button("← Voltar para lista de OS"):
             st.session_state.pop("_serv_os_carregada", None)
@@ -955,6 +980,15 @@ def pagina_adicionar_servico():
         if o.get("status") in ("aberta", "em_andamento")
     ]
 
+    # Técnico só vê OS designadas a ele (ou OS legadas sem técnico
+    # designado, que continuam abertas a todos até serem fechadas).
+    if ud["perfil"] == "tecnico":
+        meu_cod = ud.get("cod_tecnico")
+        disponiveis = [
+            o for o in disponiveis
+            if o.get("tecnico_designado") in (None, meu_cod)
+        ]
+
     if not disponiveis:
         st.info("Nenhuma OS aberta no momento. Aguarde o supervisor abrir uma OS.")
         return
@@ -982,6 +1016,15 @@ def pagina_adicionar_servico():
         equip      = os_item.get("equipamento", "-")
         cliente    = os_item.get("cliente", "-")
         dt_ab      = os_item.get("data_abertura", "-")
+        tec_desig  = os_item.get("tecnico_designado")
+        tec_desig_nome = TECNICOS.get(tec_desig, {}).get("nome") if tec_desig else None
+        tec_desig_linha = (
+            f'<div style="margin-top:0.2rem;font-size:0.78rem;color:#a5b4fc;">'
+            f'👤 Designada a: <strong>{tec_desig_nome}</strong></div>'
+            if tec_desig_nome else
+            '<div style="margin-top:0.2rem;font-size:0.78rem;color:#f59e0b;">'
+            '⚠️ Sem técnico designado (visível a todos)</div>'
+        )
 
         html_card = (
             '<div class="os-card" style="margin-bottom:0;">'
@@ -994,6 +1037,7 @@ def pagina_adicionar_servico():
             f'&nbsp;&middot;&nbsp; {equip}'
             f'&nbsp;&middot;&nbsp; {cliente}'
             '</div>'
+            f'{tec_desig_linha}'
             '<div style="margin-top:0.25rem;font-size:0.78rem;color:#64748b;">'
             f'Aberta em {dt_ab}'
             f'&nbsp;&middot;&nbsp; {n_servs} serviço(s)'
@@ -1088,11 +1132,19 @@ def pagina_os(somente_minhas: bool = False):
             # Header da OS
             col_info, col_totais = st.columns([3, 1])
             with col_info:
+                tec_desig = os_item.get("tecnico_designado")
+                tec_desig_nome = TECNICOS.get(tec_desig, {}).get("nome") if tec_desig else None
+                tec_desig_html = (
+                    f" &nbsp;&middot;&nbsp; 👤 Designada a <strong>{tec_desig_nome}</strong>"
+                    if tec_desig_nome else
+                    " &nbsp;&middot;&nbsp; <span style='color:#f59e0b;'>⚠️ sem técnico designado</span>"
+                )
                 st.markdown(
                     f"{_badge(os_item.get('status',''))} &nbsp; "
                     f"<span style='font-size:0.8rem;color:#64748b;'>"
                     f"Aberta por <strong>{os_item.get('aberto_por','?')}</strong> "
                     f"em {str(os_item.get('aberto_em',''))[:10]}"
+                    f"{tec_desig_html}"
                     f"</span>",
                     unsafe_allow_html=True
                 )
@@ -1148,6 +1200,33 @@ def pagina_os(somente_minhas: bool = False):
             if not eh_tecnico:
                 st.markdown("---")
                 status = os_item.get("status", "")
+
+                # Definir / alterar técnico designado
+                if status in ("aberta", "em_andamento"):
+                    lista_tec_nomes = {v["nome"]: k for k, v in TECNICOS.items()}
+                    nomes_tec = list(lista_tec_nomes.keys())
+                    idx_atual = (
+                        nomes_tec.index(tec_desig_nome)
+                        if tec_desig_nome in nomes_tec else 0
+                    )
+                    col_sel, col_btn2 = st.columns([3, 1])
+                    with col_sel:
+                        novo_nome_tec = st.selectbox(
+                            "Técnico designado",
+                            nomes_tec, index=idx_atual,
+                            key=f"tec_desig_{os_item.get('numero_os','')}",
+                        )
+                    with col_btn2:
+                        st.markdown("<div style='height:1.6rem'></div>", unsafe_allow_html=True)
+                        if st.button("Salvar", key=f"salvar_tec_{os_item.get('numero_os','')}",
+                                     use_container_width=True):
+                            definir_tecnico_designado(
+                                os_item.get("numero_os"),
+                                lista_tec_nomes[novo_nome_tec],
+                                st.session_state["usuario"],
+                            )
+                            st.success(f"Técnico designado: {novo_nome_tec}")
+                            st.rerun()
 
                 # Adicionar serviço (supervisor)
                 if status in ("aberta", "em_andamento"):

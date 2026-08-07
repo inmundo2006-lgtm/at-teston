@@ -350,8 +350,16 @@ def buscar_os_por_numero(numero_os: str) -> dict | None:
     return os_dict
 
 def criar_os(frota: str, equipamento: str, cod_cc: int,
-             aberto_por: str, data_abertura: str | None = None) -> dict:
-    """Cria uma nova OS (sem serviços ainda) e salva no SharePoint."""
+             aberto_por: str, data_abertura: str | None = None,
+             tecnico_designado: int | None = None) -> dict:
+    """Cria uma nova OS (sem serviços ainda) e salva no SharePoint.
+
+    tecnico_designado: cod_tecnico (chave de TECNICOS) responsável por esta OS.
+    Enquanto a OS estiver aberta/em_andamento, apenas este técnico (além de
+    supervisor/admin) pode visualizá-la para lançar serviços ou encerrá-la.
+    Se None (OS legada, criada antes deste controle), permanece visível a
+    todos os técnicos — comportamento antigo.
+    """
     numero = _gerar_numero_os()
     nova = {
         "numero_os":                   numero,
@@ -363,6 +371,7 @@ def criar_os(frota: str, equipamento: str, cod_cc: int,
         "status":                      "aberta",
         "aberto_por":                  aberto_por,
         "aberto_em":                   datetime.now().isoformat(),
+        "tecnico_designado":           tecnico_designado,
         "fechado_para_aprovacao_por":  None,
         "fechado_para_aprovacao_em":   None,
         "validado_por":                None,
@@ -373,6 +382,28 @@ def criar_os(frota: str, equipamento: str, cod_cc: int,
     _post(nova)
     carregar_os.clear()
     return nova
+
+def definir_tecnico_designado(numero_os: str, cod_tecnico: int | None,
+                               definido_por: str) -> bool:
+    """
+    Define ou altera o técnico designado de uma OS já existente
+    (usado pelo supervisor/admin — inclusive para corrigir OS legadas
+    sem técnico designado). Só permitido enquanto a OS está aberta/em_andamento.
+    """
+    sp_id, os_dict = _fetch_by_numero(numero_os)
+    if not sp_id:
+        return False
+    if os_dict["status"] not in ("aberta", "em_andamento"):
+        return False
+    os_dict["tecnico_designado"] = cod_tecnico
+    os_dict.setdefault("historico_designacao", []).append({
+        "cod_tecnico":  cod_tecnico,
+        "definido_por": definido_por,
+        "definido_em":  datetime.now().isoformat(),
+    })
+    _patch(sp_id, os_dict)
+    carregar_os.clear()
+    return True
 
 def adicionar_procedimento(numero_os: str, proc: dict) -> bool:
     """
