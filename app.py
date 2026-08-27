@@ -286,6 +286,9 @@ from dados import (
     fechar_os_para_aprovacao,
     reabrir_os, validar_os, buscar_os_por_numero,
     definir_tecnico_designado,
+    # novas — tipo/permissão de OS
+    pode_abrir_os, motivo_bloqueio_abertura, PermissaoNegada,
+    registrar_avaliacao, TIPOS_OS,
     # compat
     salvar_os, atualizar_status_os, editar_os,
 )
@@ -379,7 +382,7 @@ def render_sidebar():
         """, unsafe_allow_html=True)
 
         if ud["perfil"] == "tecnico":
-            pages = ["📋 Minhas OS", "🔧 Adicionar Serviço"]
+            pages = ["📋 Minhas OS",  "➕ Abrir Nova OS","🔧 Adicionar Serviço"]
         else:
             pages = ["📊 Dashboard", "✅ Validações", "📋 Todas as OS",
                      "➕ Abrir Nova OS", "🔧 Adicionar Serviço",
@@ -797,16 +800,38 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
 # ─────────────────────────────────────────────
 
 def pagina_abrir_os():
-    ud = st.session_state["user_data"]
+    ud     = st.session_state["user_data"]
+    perfil = ud["perfil"]
     st.markdown("""<div class="section-header">
         <span style="font-size:1.3rem">➕</span><h3>Abrir Nova Ordem de Serviço</h3>
     </div>""", unsafe_allow_html=True)
 
-    st.info("Informe os dados do equipamento. Os técnicos adicionarão os serviços depois.")
+    # Quais tipos este perfil pode abrir (a regra vive no dados.py)
+    tipos_permitidos = [t for t in TIPOS_OS if pode_abrir_os(perfil, t, "manual")]
+    if not tipos_permitidos:
+        st.error("Seu perfil não pode abrir OS.")
+        return
+
+    if perfil == "tecnico":
+        st.info(
+            "Você pode abrir **OS externa** (campo, deslocamento, M.S). "
+            "OS interna é aberta pelo supervisor, ou automaticamente pelo "
+            "app de Checklist de Veículos."
+        )
+    else:
+        st.info("Informe os dados do equipamento. Os técnicos adicionarão os serviços depois.")
 
     FROTAS = carregar_frotas()
 
     with st.form("form_nova_os"):
+        tipo_os = st.radio(
+            "Tipo de OS", tipos_permitidos, horizontal=True,
+            format_func=lambda t: {
+                "interna": "🏠 Interna (barracão)",
+                "externa": "🚚 Externa (campo / deslocamento / M.S)",
+            }.get(t, t),
+        )
+
         c1, c2 = st.columns(2)
         with c1:
             data_ab   = st.date_input("Data de Abertura", value=date.today())
@@ -825,26 +850,50 @@ def pagina_abrir_os():
             placeholder="Será preenchido automaticamente ao digitar a frota",
         )
 
-        lista_tec_nomes = {v["nome"]: k for k, v in TECNICOS.items()}
-        nome_tec_sel = st.selectbox(
-            "Técnico Responsável",
-            list(lista_tec_nomes.keys()),
-            help="Apenas este técnico verá esta OS para lançar serviços e encerrá-la.",
+        avaliacao = st.text_area(
+            "Avaliação",
+            placeholder=("Descreva o problema apresentado pelo veículo — ex: para-brisa "
+                         "trincado, motor com fumaça excessiva, vazamento hidráulico."),
+            height=110,
+            help="Obrigatório. É o que orienta quem vai executar o serviço.",
         )
-        cod_tecnico_sel = lista_tec_nomes[nome_tec_sel]
+
+        # Técnico: mecânico abre para si mesmo; supervisor escolhe.
+        if perfil == "tecnico" and ud.get("cod_tecnico"):
+            cod_tecnico_sel = ud["cod_tecnico"]
+            nome_tec_sel    = TECNICOS[cod_tecnico_sel]["nome"]
+            st.text_input("Técnico Responsável", value=nome_tec_sel, disabled=True)
+        else:
+            lista_tec_nomes = {v["nome"]: k for k, v in TECNICOS.items()}
+            nome_tec_sel = st.selectbox(
+                "Técnico Responsável", list(lista_tec_nomes.keys()),
+                help="Apenas este técnico verá esta OS para lançar serviços e encerrá-la.",
+            )
+            cod_tecnico_sel = lista_tec_nomes[nome_tec_sel]
 
         if st.form_submit_button("🚀 Abrir OS", type="primary", use_container_width=True):
             if not frota:
                 st.error("Informe a frota.")
+            elif not avaliacao.strip():
+                st.error("Preencha a Avaliação — descreva o problema do veículo.")
             else:
-                nova = criar_os(
-                    frota=frota,
-                    equipamento=equipamento or desc_frota or frota,
-                    cod_cc=cod_cc,
-                    aberto_por=st.session_state["usuario"],
-                    data_abertura=str(data_ab),
-                    tecnico_designado=cod_tecnico_sel,
-                )
+                try:
+                    nova = criar_os(
+                        frota=frota,
+                        equipamento=equipamento or desc_frota or frota,
+                        cod_cc=cod_cc,
+                        aberto_por=st.session_state["usuario"],
+                        data_abertura=str(data_ab),
+                        tecnico_designado=cod_tecnico_sel,
+                        perfil_usuario=perfil,
+                        tipo_os=tipo_os,
+                        avaliacao=avaliacao,
+                        origem="manual",
+                    )
+                except PermissaoNegada as e:
+                    st.error(f"🚫 {e}")
+                    return
+
                 st.success(f"✅ OS **{nova['numero_os']}** criada com sucesso!")
                 st.balloons()
                 st.markdown(f"""
@@ -856,13 +905,10 @@ def pagina_abrir_os():
                         {nova['numero_os']}
                     </div>
                     <div style="font-size:0.85rem;color:#6ee7b7;margin-top:0.25rem;">
-                        Frota {frota} · {CENTROS_CUSTO[cod_cc]}
+                        Frota {frota} · {CENTROS_CUSTO[cod_cc]} · OS {tipo_os}
                     </div>
                     <div style="font-size:0.85rem;color:#6ee7b7;margin-top:0.15rem;">
                         Técnico responsável: {nome_tec_sel}
-                    </div>
-                    <div style="font-size:0.78rem;color:#4a7c59;margin-top:0.5rem;">
-                        Apenas {nome_tec_sel} verá esta OS para lançar serviços.
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1084,7 +1130,8 @@ def pagina_os(somente_minhas: bool = False):
         meu_cod = ud.get("cod_tecnico")
         todas = [
             o for o in todas
-            if any(p.get("cod_tecnico") == meu_cod for p in o.get("procedimentos", []))
+            if o.get("tecnico_designado") == meu_cod
+            or any(p.get("cod_tecnico") == meu_cod for p in o.get("procedimentos", []))
         ]
 
     if not todas:
@@ -1148,6 +1195,24 @@ def pagina_os(somente_minhas: bool = False):
                     f"</span>",
                     unsafe_allow_html=True
                 )
+                origem_os = os_item.get("origem", "manual")
+                tipo_os   = os_item.get("tipo_os", "—")
+                selo = ("🔗 vinda do Checklist" if origem_os == "checklist"
+                        else "✍️ aberta manualmente")
+                st.markdown(
+                    f'<div style="font-size:0.8rem;color:#94a3b8;margin-bottom:0.4rem;">'
+                    f'{selo} &nbsp;·&nbsp; OS <strong>{tipo_os}</strong></div>',
+                    unsafe_allow_html=True)
+
+                if os_item.get("cc_pendente"):
+                    st.warning(
+                        f"⚠️ Centro de custo não reconhecido: “{os_item.get('cliente','—')}”. "
+                        "Corrija antes de aprovar esta OS."
+                    )
+
+                if os_item.get("avaliacao"):
+                    with st.expander("🩺 Avaliação (problema relatado)", expanded=False):
+                        st.text(os_item["avaliacao"])
                 if os_item.get("observacao_validacao"):
                     st.caption(f"💬 Obs. validação: {os_item['observacao_validacao']}")
             with col_totais:

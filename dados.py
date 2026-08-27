@@ -119,6 +119,47 @@ CENTROS_CUSTO = {
 NIVEIS_TECNICOS = list(TABELA_HORA.keys())
 
 # ─────────────────────────────────────────────
+#  TIPO E ORIGEM DA OS  (novo)
+# ─────────────────────────────────────────────
+#  tipo_os define QUEM pode abrir; origem registra DE ONDE veio.
+#  A matriz abaixo é a única fonte da regra — a UI apenas a consulta.
+
+TIPOS_OS   = ("interna", "externa")
+ORIGENS_OS = ("manual", "checklist")
+
+# Locais de serviço considerados internos (para consistência de lançamento)
+LOCAIS_INTERNOS = ("interno barracão",)
+
+
+def pode_abrir_os(perfil: str, tipo_os: str, origem: str = "manual") -> bool:
+    """
+    Regra de permissão de abertura de OS.
+
+      - OS vinda do checklist: sempre permitida (é interna por definição).
+      - OS externa: técnico, supervisor e admin podem abrir.
+      - OS interna: somente supervisor e admin.
+    """
+    if origem == "checklist":
+        return True
+    if tipo_os == "externa":
+        return perfil in ("tecnico", "supervisor", "admin")
+    if tipo_os == "interna":
+        return perfil in ("supervisor", "admin")
+    return False
+
+
+def motivo_bloqueio_abertura(perfil: str, tipo_os: str, origem: str = "manual") -> str:
+    """Mensagem explicando por que a abertura foi negada (para exibir na UI)."""
+    if tipo_os not in TIPOS_OS:
+        return f"Tipo de OS inválido: '{tipo_os}'. Use 'interna' ou 'externa'."
+    if origem not in ORIGENS_OS:
+        return f"Origem de OS inválida: '{origem}'."
+    if tipo_os == "interna" and perfil == "tecnico":
+        return ("OS interna só pode ser aberta por supervisor ou administrador. "
+                "Se o veículo passou por checklist, abra a OS pelo app de Checklist.")
+    return "Seu perfil não tem permissão para abrir esta OS."
+
+# ─────────────────────────────────────────────
 #  EQUIPAMENTOS  (sem alteração)
 # ─────────────────────────────────────────────
 
@@ -277,15 +318,58 @@ def _fetch_all() -> list[dict]:
         url = data.get("@odata.nextLink")
     return items
 
-def _fetch_by_numero(numero_os: str) -> tuple[str | None, dict | None]:
-    """Retorna (sp_item_id, os_dict) para um numero_os."""
+def _escapar_odata(valor: str) -> str:
+    """Escapa aspas simples para uso dentro de um $filter OData."""
+    return str(valor).replace("'", "''")
+
+
+def _itens_brutos_por_titulo(numero_os: str) -> list[dict]:
+    """Retorna TODOS os itens do SharePoint com este Title (normalmente 0 ou 1).
+    Mais de um significa colisão de numeração — tratada em _post_com_numero_unico."""
     url = (
         _base_url()
-        + f"?$expand=fields&$filter=fields/Title eq '{numero_os}'"
+        + f"?$expand=fields&$filter=fields/Title eq '{_escapar_odata(numero_os)}'"
     )
     r = requests.get(url, headers=_headers(), timeout=15)
     _raise_com_detalhe(r)
-    items = r.json().get("value", [])
+    return r.json().get("value", [])
+
+
+def _itens_brutos_por_prefixo(prefixo: str) -> list[dict]:
+    """Itens cujo Title começa com o prefixo (ex: 'OS-2026-').
+    Evita varrer a lista inteira só para descobrir o próximo número.
+    Se o SharePoint recusar o startswith, cai para a varredura completa."""
+    url = (
+        _base_url()
+        + f"?$expand=fields&$top=999"
+        + f"&$filter=startswith(fields/Title,'{_escapar_odata(prefixo)}')"
+    )
+    itens = []
+    try:
+        while url:
+            r = requests.get(url, headers=_headers(), timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            itens.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")
+        return itens
+    except requests.HTTPError:
+        # Fallback: lista completa, filtrando na memória.
+        url = _base_url() + "?$expand=fields&$top=999"
+        itens = []
+        while url:
+            r = requests.get(url, headers=_headers(), timeout=20)
+            _raise_com_detalhe(r)
+            data = r.json()
+            itens.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")
+        return [i for i in itens
+                if str(i.get("fields", {}).get("Title", "")).startswith(prefixo)]
+
+
+def _fetch_by_numero(numero_os: str) -> tuple[str | None, dict | None]:
+    """Retorna (sp_item_id, os_dict) para um numero_os."""
+    items = _itens_brutos_por_titulo(numero_os)
     if not items:
         return None, None
     item = items[0]
@@ -300,6 +384,10 @@ def _patch(sp_item_id: str, os_dict: dict) -> None:
         "DadosOS": json.dumps(os_clean, ensure_ascii=False),
         "Status":  os_dict.get("status", ""),
     }
+    # O Title precisa acompanhar o numero_os — sem isso, uma renumeração
+    # por colisão deixaria o Title antigo e a busca por número quebraria.
+    if os_dict.get("numero_os"):
+        payload["Title"] = os_dict["numero_os"]
     r = requests.patch(url, headers=_headers(), json=payload, timeout=15)
     _raise_com_detalhe(r)
 
@@ -317,19 +405,58 @@ def _post(os_dict: dict) -> str:
     _raise_com_detalhe(r)
     return r.json()["id"]
 
-def _gerar_numero_os() -> str:
-    """Gera próximo número de OS do ano corrente (ex: OS-2026-0006)."""
-    todas = carregar_os()
-    ano   = datetime.now().year
+def _proximo_numero_livre(ano: int) -> str:
+    """
+    Próximo número livre do ano, lido DIRETO do SharePoint (sem cache).
+
+    A versão anterior lia de carregar_os(), que tem cache de 30 s — com dois
+    apps escrevendo (oficina + checklist), isso gerava números repetidos.
+    """
+    prefixo = f"OS-{ano}-"
     max_n = 0
-    for o in todas:
-        n = o.get("numero_os", "")
-        if n.startswith(f"OS-{ano}-"):
-            try:
-                max_n = max(max_n, int(n.rsplit("-", 1)[-1]))
-            except ValueError:
-                pass
-    return f"OS-{ano}-{(max_n + 1):04d}"
+    for item in _itens_brutos_por_prefixo(prefixo):
+        titulo = str(item.get("fields", {}).get("Title", ""))
+        try:
+            max_n = max(max_n, int(titulo.rsplit("-", 1)[-1]))
+        except ValueError:
+            pass
+    return f"{prefixo}{(max_n + 1):04d}"
+
+
+def _post_com_numero_unico(os_dict: dict, tentativas: int = 8) -> tuple[str, str]:
+    """
+    Cria a OS garantindo número único, mesmo com dois apps gravando ao
+    mesmo tempo. Retorna (sp_item_id, numero_os_final).
+
+    Como funciona o desempate, sem precisar de lock:
+      1. Grava com o próximo número livre.
+      2. Reconsulta o Title. Se só existe um item, terminou.
+      3. Se existem dois (colisão), quem tem o MENOR id do SharePoint fica
+         com o número — o id é atômico e único, então os dois lados chegam
+         à mesma conclusão sem se falarem.
+      4. Quem perdeu o desempate assume o próximo número livre e regrava.
+    """
+    ano = datetime.now().year
+    os_dict["numero_os"] = _proximo_numero_livre(ano)
+    sp_id = _post(os_dict)
+
+    for _ in range(tentativas):
+        conflitantes = _itens_brutos_por_titulo(os_dict["numero_os"])
+        if len(conflitantes) <= 1:
+            return sp_id, os_dict["numero_os"]
+
+        vencedor = min(conflitantes, key=lambda i: int(i["id"]))
+        if str(vencedor["id"]) == str(sp_id):
+            return sp_id, os_dict["numero_os"]
+
+        # Perdemos o desempate: pega o próximo livre e regrava este item.
+        os_dict["numero_os"] = _proximo_numero_livre(ano)
+        _patch(sp_id, os_dict)
+
+    raise RuntimeError(
+        "Não foi possível obter um número de OS único após várias tentativas. "
+        "Verifique se há gravações concorrentes na lista AT_Teston_OS."
+    )
 
 # ═══════════════════════════════════════════════════════════════
 #  API PÚBLICA  —  mesma interface do dados.py original
@@ -349,25 +476,57 @@ def buscar_os_por_numero(numero_os: str) -> dict | None:
     _, os_dict = _fetch_by_numero(numero_os)
     return os_dict
 
-def criar_os(frota: str, equipamento: str, cod_cc: int,
+class PermissaoNegada(Exception):
+    """Levantada quando o perfil não pode abrir o tipo de OS solicitado."""
+
+
+def criar_os(frota: str, equipamento: str, cod_cc: int | None,
              aberto_por: str, data_abertura: str | None = None,
-             tecnico_designado: int | None = None) -> dict:
+             tecnico_designado: int | None = None,
+             *,
+             perfil_usuario: str = "admin",
+             tipo_os: str = "interna",
+             avaliacao: str = "",
+             origem: str = "manual",
+             checklist_id: str | None = None,
+             cliente_texto: str | None = None) -> dict:
     """Cria uma nova OS (sem serviços ainda) e salva no SharePoint.
 
     tecnico_designado: cod_tecnico (chave de TECNICOS) responsável por esta OS.
     Enquanto a OS estiver aberta/em_andamento, apenas este técnico (além de
     supervisor/admin) pode visualizá-la para lançar serviços ou encerrá-la.
-    Se None (OS legada, criada antes deste controle), permanece visível a
-    todos os técnicos — comportamento antigo.
+
+    perfil_usuario / tipo_os / origem: governam a permissão de abertura.
+    A validação vive AQUI, e não só na tela, porque o app de checklist chama
+    esta função direto — esconder o formulário no app.py não protegeria nada.
+
+    avaliacao: descrição livre do problema apresentado pelo veículo.
+    checklist_id: id do item em ChecklistVeiculos que originou a OS.
+    cliente_texto: nome do CC quando cod_cc não pôde ser resolvido (deixa a
+    OS rastreável em vez de gravar cliente vazio).
     """
-    numero = _gerar_numero_os()
+    if not pode_abrir_os(perfil_usuario, tipo_os, origem):
+        raise PermissaoNegada(motivo_bloqueio_abertura(perfil_usuario, tipo_os, origem))
+
+    if origem == "checklist":
+        tipo_os = "interna"          # decisão de negócio: checklist é sempre interna
+
+    cliente = CENTROS_CUSTO.get(cod_cc, "") if cod_cc is not None else ""
+    if not cliente and cliente_texto:
+        cliente = cliente_texto
+
     nova = {
-        "numero_os":                   numero,
+        "numero_os":                   None,   # definido por _post_com_numero_unico
         "data_abertura":               data_abertura or datetime.now().strftime("%Y-%m-%d"),
         "frota":                       frota,
         "equipamento":                 equipamento,
         "cod_cc":                      cod_cc,
-        "cliente":                     CENTROS_CUSTO.get(cod_cc, ""),
+        "cliente":                     cliente,
+        "cc_pendente":                 cod_cc is None,
+        "tipo_os":                     tipo_os,
+        "origem":                      origem,
+        "checklist_id":                checklist_id,
+        "avaliacao":                   (avaliacao or "").strip(),
         "status":                      "aberta",
         "aberto_por":                  aberto_por,
         "aberto_em":                   datetime.now().isoformat(),
@@ -379,9 +538,27 @@ def criar_os(frota: str, equipamento: str, cod_cc: int,
         "observacao_validacao":        "",
         "procedimentos":               [],
     }
-    _post(nova)
+    _, numero = _post_com_numero_unico(nova)
+    nova["numero_os"] = numero
     carregar_os.clear()
     return nova
+
+
+def registrar_avaliacao(numero_os: str, avaliacao: str, editado_por: str) -> bool:
+    """Atualiza o campo Avaliação de uma OS ainda aberta/em andamento."""
+    sp_id, os_dict = _fetch_by_numero(numero_os)
+    if not sp_id:
+        return False
+    if os_dict["status"] not in ("aberta", "em_andamento"):
+        return False
+    os_dict["avaliacao"] = (avaliacao or "").strip()
+    os_dict.setdefault("historico_avaliacao", []).append({
+        "editado_por": editado_por,
+        "editado_em":  datetime.now().isoformat(),
+    })
+    _patch(sp_id, os_dict)
+    carregar_os.clear()
+    return True
 
 def definir_tecnico_designado(numero_os: str, cod_tecnico: int | None,
                                definido_por: str) -> bool:
