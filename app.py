@@ -826,7 +826,9 @@ def pagina_abrir_os():
 
     FROTAS = carregar_frotas()
 
-    with st.form("form_nova_os"):
+    # Sem st.form de propósito: dentro de um form o Streamlit não re-executa
+    # enquanto se digita, e o Equipamento nunca preencheria a partir da frota.
+    with st.container():
         tipo_os = st.radio(
             "Tipo de OS", tipos_permitidos, horizontal=True,
             format_func=lambda t: {
@@ -838,20 +840,30 @@ def pagina_abrir_os():
         c1, c2 = st.columns(2)
         with c1:
             data_ab   = st.date_input("Data de Abertura", value=date.today())
-            frota_val = st.text_input("Frota", placeholder="Ex: 1201")
+            frota_val = st.text_input("Frota", placeholder="Ex: 1201", key="_os_frota")
         with c2:
             lista_cc = {f"{k} - {v}": k for k, v in CENTROS_CUSTO.items()}
             ccs = list(lista_cc.keys())
             cod_cc = lista_cc[st.selectbox("Centro de Custo / Cliente", ccs)]
 
-        frota = frota_val.strip()
+        frota = (frota_val or "").strip()
         desc_frota = FROTAS.get(frota, "")
+
+        # Só sobrescreve o Equipamento quando a frota MUDA e existe no cadastro.
+        # Assim o que o usuário digitou à mão não é apagado a cada tecla.
+        st.session_state.setdefault("_os_equip", "")
+        if desc_frota and st.session_state.get("_os_frota_ant") != frota:
+            st.session_state["_os_equip"]     = desc_frota
+            st.session_state["_os_frota_ant"] = frota
 
         equipamento = st.text_input(
             "Equipamento / Descrição",
-            value=desc_frota,
-            placeholder="Será preenchido automaticamente ao digitar a frota",
+            key="_os_equip",
+            placeholder="Preenchido automaticamente ao digitar a frota",
         )
+        if frota and not desc_frota:
+            st.caption(f"⚠️ Frota {frota} não encontrada no CADASTRO.xlsx — "
+                       "descreva o equipamento manualmente.")
 
         avaliacao = st.text_area(
             "Avaliação",
@@ -874,7 +886,7 @@ def pagina_abrir_os():
             )
             cod_tecnico_sel = lista_tec_nomes[nome_tec_sel]
 
-        if st.form_submit_button("🚀 Abrir OS", type="primary", use_container_width=True):
+        if st.button("🚀 Abrir OS", type="primary", use_container_width=True):
             if not frota:
                 st.error("Informe a frota.")
             elif not avaliacao.strip():
