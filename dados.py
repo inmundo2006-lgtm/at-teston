@@ -285,9 +285,15 @@ def _parse_item(item: dict) -> dict | None:
             return None
         os_dict = json.loads(dados_json)
         os_dict["_sp_item_id"] = item["id"]   # ID interno do SP (para updates)
-        # garante que cod_cc é int (JSON deserializa como int normalmente)
-        if "cod_cc" in os_dict:
-            os_dict["cod_cc"] = int(os_dict["cod_cc"])
+        # cod_cc é int quando existe, mas pode ser None em OS vinda do
+        # checklist cujo centro de custo não foi reconhecido (cc_pendente).
+        # int(None) levantaria TypeError e faria a OS sumir da lista.
+        if os_dict.get("cod_cc") is not None:
+            try:
+                os_dict["cod_cc"] = int(os_dict["cod_cc"])
+            except (TypeError, ValueError):
+                os_dict["cod_cc"]     = None
+                os_dict["cc_pendente"] = True
         return os_dict
     except Exception:
         return None

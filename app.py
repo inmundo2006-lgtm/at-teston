@@ -513,7 +513,10 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
 
     with c3:
         # CC herdado da OS — exibe apenas como info, não editável no serviço
-        st.text_input("Centro de Custo", value=f"{os_item['cod_cc']} - {os_item['cliente']}", disabled=True)
+        cc_txt = (f"{os_item['cod_cc']} - {os_item['cliente']}"
+                  if os_item.get("cod_cc") is not None
+                  else f"⚠️ pendente - {os_item.get('cliente','—')}")
+        st.text_input("Centro de Custo", value=cc_txt, disabled=True)
         st.caption("Herdado da OS — altere na OS se necessário")
 
     st.markdown("---")
@@ -1344,7 +1347,7 @@ def pagina_validacoes():
 **Frota:** {os_item['frota']} &nbsp;·&nbsp;
 **Equipamento:** {os_item.get('equipamento','-')}
 
-**Centro de Custo:** {os_item.get('cod_cc','?')} — {os_item.get('cliente','?')}
+**Centro de Custo:** {os_item.get('cod_cc') if os_item.get('cod_cc') is not None else '⚠️ pendente'} — {os_item.get('cliente','?')}
 
 **Aberta por:** {os_item.get('aberto_por','?')} em {str(os_item.get('aberto_em',''))[:10]}
 
@@ -1562,7 +1565,7 @@ def pagina_exportar():
                 "Status OS":      o.get("status",""),
                 "Frota":          o.get("frota",""),
                 "Equipamento":    o.get("equipamento",""),
-                "Cod CC":         o.get("cod_cc",""),
+                "Cod CC":         o.get("cod_cc") or "",
                 "Cliente":        o.get("cliente",""),
                 "Seq Servico":    p.get("seq",""),
                 "Data Servico":   p.get("data",""),
