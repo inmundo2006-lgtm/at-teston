@@ -12,17 +12,10 @@ from cidades import campo_cidade
 # ─────────────────────────────────────────────
 #  TABELA DE FROTAS
 # ─────────────────────────────────────────────
-@st.cache_data
-def carregar_frotas():
-    caminho = os.path.join(os.path.dirname(__file__), "CADASTRO.xlsx")
-    try:
-        df = pd.read_excel(caminho)
-        df.columns = df.columns.str.strip()
-        df["FROTA"]     = df["FROTA"].astype(str).str.strip()
-        df["DESCRICAO"] = df["DESCRICAO"].astype(str).str.strip()
-        return dict(zip(df["FROTA"], df["DESCRICAO"]))
-    except Exception:
-        return {}
+# Vem da lista KanbanFrotas do SharePoint — a mesma que o app de Checklist
+# usa. O CADASTRO.xlsx virou fallback (só descrição), porque só era
+# atualizado quando alguém lembrava de reenviar a planilha.
+from frotas import carregar_frotas, alerta_status
 
 # ─────────────────────────────────────────────
 #  CONFIGURAÇÃO
@@ -291,7 +284,7 @@ from dados import (
     pode_abrir_os, motivo_bloqueio_abertura, PermissaoNegada,
     registrar_avaliacao, TIPOS_OS,
     LOCAIS_OS, LABELS_LOCAIS_OS, tipo_os_do_local,
-    NATUREZAS, LABELS_NATUREZA,
+    NATUREZAS, LABELS_NATUREZA, resolver_cod_cc,
     # compat
     salvar_os, atualizar_status_os, editar_os,
 )
@@ -1155,12 +1148,31 @@ def pagina_abrir_os():
             data_ab = st.date_input("Data de Abertura", value=date.today())
             frota_val = ("" if eh_desloc_os else
                          st.text_input("Frota", placeholder="Ex: 1201", key="_os_frota"))
-        with c2:
-            lista_cc = {f"{k} - {v}": k for k, v in CENTROS_CUSTO.items()}
-            cod_cc = lista_cc[st.selectbox("Centro de Custo / Cliente", list(lista_cc.keys()))]
 
         frota = (frota_val or "").strip()
-        desc_frota = FROTAS.get(frota, "")
+        info_frota = FROTAS.get(frota, {})
+        desc_frota = info_frota.get("descricao", "")
+
+        # O centro de custo da frota vem do cadastro. É o campo que mais
+        # errava sendo escolhido na mão — daí a OS nascer com CC pendente.
+        lista_cc = {f"{k} - {v}": k for k, v in CENTROS_CUSTO.items()}
+        rotulos_cc = list(lista_cc.keys())
+        idx_cc = 0
+        cc_da_frota = info_frota.get("cc_nome", "")
+        cod_cc_sugerido, _ = resolver_cod_cc(cc_da_frota) if cc_da_frota else (None, "")
+        if cod_cc_sugerido is not None:
+            alvo = f"{cod_cc_sugerido} - {CENTROS_CUSTO[cod_cc_sugerido]}"
+            if alvo in rotulos_cc:
+                idx_cc = rotulos_cc.index(alvo)
+
+        with c2:
+            cod_cc = lista_cc[st.selectbox("Centro de Custo / Cliente",
+                                            rotulos_cc, index=idx_cc)]
+            if cc_da_frota and cod_cc_sugerido is not None:
+                st.caption(f"↩️ Sugerido pelo cadastro da frota: {cc_da_frota}")
+            elif cc_da_frota:
+                st.caption(f"⚠️ Cadastro da frota diz “{cc_da_frota}”, que não existe "
+                           "na tabela de centros de custo. Escolha manualmente.")
 
         if eh_desloc_os:
             equipamento = "Deslocamento"
@@ -1175,8 +1187,11 @@ def pagina_abrir_os():
                 "Equipamento / Descrição", key="_os_equip",
                 placeholder="Preenchido automaticamente ao digitar a frota")
             if frota and not desc_frota:
-                st.caption(f"⚠️ Frota {frota} não encontrada no CADASTRO.xlsx — "
+                st.caption(f"⚠️ Frota {frota} não encontrada no cadastro — "
                            "descreva o equipamento manualmente.")
+            aviso = alerta_status(info_frota.get("status", ""))
+            if aviso:
+                st.warning(aviso)
 
         avaliacao = st.text_area(
             "Avaliação",

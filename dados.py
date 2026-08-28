@@ -167,6 +167,46 @@ def tipo_os_do_local(local: str) -> str:
     return "interna" if (local or "").strip().lower() in LOCAIS_INTERNOS else "externa"
 
 
+def _normalizar_txt(txt: str) -> str:
+    import unicodedata
+    txt = unicodedata.normalize("NFKD", str(txt or ""))
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    return " ".join(txt.upper().split())
+
+
+def resolver_cod_cc(cc_nome: str) -> tuple[int | None, str]:
+    """
+    Converte o nome do centro de custo (como vem da lista KanbanFrotas,
+    ex: '038 - AGRO ASTORGA') no cod_cc inteiro da oficina.
+
+    A comparação por NOME vem primeiro de propósito: o prefixo numérico
+    das listas do Kanban não é necessariamente o mesmo código do centro de
+    custo daqui. Só depois, e só se o nome conferir, o prefixo é aceito.
+
+    Devolve (None, texto_original) quando não reconhece — quem chama decide
+    se bloqueia ou se marca como pendente.
+    """
+    bruto = str(cc_nome or "").strip()
+    if not bruto:
+        return None, ""
+
+    alvo = _normalizar_txt(bruto)
+    prefixo, _, resto = alvo.partition("-")
+    sem_prefixo = resto.strip() if prefixo.strip().isdigit() else alvo
+
+    for cod, nome in CENTROS_CUSTO.items():
+        if _normalizar_txt(nome) in (alvo, sem_prefixo):
+            return cod, nome
+
+    if prefixo.strip().isdigit():
+        cod = int(prefixo.strip())
+        nome_oficial = CENTROS_CUSTO.get(cod)
+        if nome_oficial and _normalizar_txt(nome_oficial)[:8] == sem_prefixo[:8]:
+            return cod, nome_oficial
+
+    return None, bruto
+
+
 def pode_abrir_os(perfil: str, tipo_os: str, origem: str = "manual") -> bool:
     """
     Regra de permissão de abertura de OS.
