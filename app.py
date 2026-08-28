@@ -5,8 +5,9 @@ import hashlib
 import os
 from datetime import date, datetime, time
 
-from calculos import calcular_comissao_os
+from calculos import calcular_servico, calcular_deslocamento
 from tempos_fixos import carregar_tabela_tempos, formatar_horas, NENHUM_COMPONENTE
+from cidades import campo_cidade
 
 # ─────────────────────────────────────────────
 #  TABELA DE FROTAS
@@ -289,6 +290,8 @@ from dados import (
     # novas — tipo/permissão de OS
     pode_abrir_os, motivo_bloqueio_abertura, PermissaoNegada,
     registrar_avaliacao, TIPOS_OS,
+    LOCAIS_OS, LABELS_LOCAIS_OS, tipo_os_do_local,
+    NATUREZAS, LABELS_NATUREZA,
     # compat
     salvar_os, atualizar_status_os, editar_os,
 )
@@ -325,7 +328,23 @@ def _total_comissao_os(os_item: dict) -> float:
     return sum(float(p.get("comissao", 0)) for p in os_item.get("procedimentos", []))
 
 def _total_servico_os(os_item: dict) -> float:
-    return sum(float(p.get("valor_servico", 0)) for p in os_item.get("procedimentos", []))
+    """
+    Valor cobrado da OS — equivale à coluna "Serviço" da planilha
+    (horas + KM + munck + deslocamento).
+
+    Usa valor_total, que já vem somado do calculos.py. Somar apenas
+    valor_servico deixaria os lançamentos de deslocamento de fora, já
+    que neles esse campo é zero.
+    """
+    total = 0.0
+    for p in os_item.get("procedimentos", []):
+        if p.get("valor_total") is not None:
+            total += float(p.get("valor_total") or 0)
+        else:  # lançamento antigo, sem o campo
+            total += (float(p.get("valor_servico", 0) or 0)
+                      + float(p.get("valor_km", 0) or 0)
+                      + float(p.get("valor_munck", 0) or 0))
+    return total
 
 def _resumo_tecnicos(os_item: dict) -> str:
     nomes = list(dict.fromkeys(
@@ -367,11 +386,89 @@ def tela_login():
                     st.error("Usuário ou senha incorretos.")
 
 # ─────────────────────────────────────────────
-#  SIDEBAR
+#  NAVEGAÇÃO
 # ─────────────────────────────────────────────
 
-def render_sidebar():
-    ud = st.session_state["user_data"]
+PAGES_TECNICO = ["📋 Minhas OS", "➕ Abrir Nova OS", "🔧 Adicionar Serviço"]
+
+PAGES_GESTAO = ["📊 Dashboard", "✅ Validações", "📋 Todas as OS",
+                "➕ Abrir Nova OS", "🔧 Adicionar Serviço",
+                "💰 Comissões", "📤 Exportar Relatório", "⚙️ Configurações"]
+
+# Rótulos curtos para o menu do topo — o valor continua o mesmo, só o
+# texto exibido encolhe, para caber na largura de um celular.
+LABELS_CURTOS = {
+    "📋 Minhas OS":         "📋 Minhas OS",
+    "📋 Todas as OS":       "📋 Todas",
+    "➕ Abrir Nova OS":     "➕ Abrir OS",
+    "🔧 Adicionar Serviço": "🔧 Lançar",
+    "📤 Exportar Relatório": "📤 Exportar",
+    "⚙️ Configurações":     "⚙️ Config.",
+}
+
+CSS_SEM_SIDEBAR = """
+<style>
+[data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none !important; }
+[data-testid="block-container"] { padding-top: 0.5rem; }
+</style>
+"""
+
+
+def _seletor_topo(pages: list[str]) -> str:
+    """
+    Seletor horizontal do menu. Tenta os widgets mais novos primeiro e cai
+    para o radio horizontal, que existe em qualquer versão do Streamlit.
+    """
+    atual = st.session_state.get("page")
+    idx = pages.index(atual) if atual in pages else 0
+    rotulo = lambda p: LABELS_CURTOS.get(p, p)
+
+    if hasattr(st, "segmented_control"):
+        escolha = st.segmented_control(
+            "Navegação", pages, default=pages[idx],
+            format_func=rotulo, label_visibility="collapsed", key="_nav_topo")
+        return escolha or pages[idx]
+
+    if hasattr(st, "pills"):
+        escolha = st.pills(
+            "Navegação", pages, default=pages[idx],
+            format_func=rotulo, label_visibility="collapsed", key="_nav_topo")
+        return escolha or pages[idx]
+
+    return st.radio("Navegação", pages, index=idx, horizontal=True,
+                    format_func=rotulo, label_visibility="collapsed",
+                    key="_nav_topo")
+
+
+def _sair():
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.rerun()
+
+
+def _nav_topo(ud) -> str:
+    """Menu no topo — técnico e supervisor, pensado para o celular."""
+    st.markdown(CSS_SEM_SIDEBAR, unsafe_allow_html=True)
+
+    c_user, c_sair = st.columns([4, 1])
+    with c_user:
+        st.markdown(
+            f'<div style="font-size:0.85rem;color:#94a3b8;padding-top:0.4rem;">'
+            f'👤 <strong style="color:#e2e8f0;">{ud["nome"]}</strong>'
+            f' &nbsp;·&nbsp; {ud["perfil"].upper()}</div>',
+            unsafe_allow_html=True)
+    with c_sair:
+        if st.button("🚪 Sair", use_container_width=True):
+            _sair()
+
+    page = _seletor_topo(PAGES_TECNICO if ud["perfil"] == "tecnico" else PAGES_GESTAO)
+    st.session_state["page"] = page
+    st.markdown("---")
+    return page
+
+
+def _nav_sidebar(ud) -> str:
+    """Menu lateral — admin, que trabalha no PC."""
     with st.sidebar:
         st.markdown(f"""
         <div style="padding:1rem 0;border-bottom:1px solid #3d4a5c;margin-bottom:1rem;">
@@ -381,119 +478,112 @@ def render_sidebar():
         </div>
         """, unsafe_allow_html=True)
 
-        if ud["perfil"] == "tecnico":
-            pages = ["📋 Minhas OS",  "➕ Abrir Nova OS","🔧 Adicionar Serviço"]
-        else:
-            pages = ["📊 Dashboard", "✅ Validações", "📋 Todas as OS",
-                     "➕ Abrir Nova OS", "🔧 Adicionar Serviço",
-                     "💰 Comissões", "📤 Exportar Relatório", "⚙️ Configurações"]
-
+        pages = PAGES_TECNICO if ud["perfil"] == "tecnico" else PAGES_GESTAO
         page = st.radio("Navegação", pages, label_visibility="collapsed")
         st.session_state["page"] = page
         st.markdown("---")
         if st.button("🚪 Sair", use_container_width=True):
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            st.rerun()
+            _sair()
     return page
 
-# ─────────────────────────────────────────────
-#  RECALC PREVIEW (serviço)
-# ─────────────────────────────────────────────
 
-def _recalc_preview():
-    cod_tec = st.session_state.get("_pr_cod_tecnico", 1)
-    local   = st.session_state.get("_pr_local", "interno barracão")
-    h_s     = st.session_state.get("_pr_hora_saida",  time(7,  30))
-    h_c     = st.session_state.get("_pr_hora_cheg",   time(16, 30))
-    km_i    = st.session_state.get("_pr_km_ini",  0.0)
-    km_f    = st.session_state.get("_pr_km_fim",  0.0)
-    m_i     = st.session_state.get("_pr_mun_ini", 0.0)
-    m_f     = st.session_state.get("_pr_mun_fim", 0.0)
+def render_sidebar() -> str:
+    """
+    Ponto de entrada da navegação. Mantém o nome antigo porque o main()
+    chama por ele.
 
-    tec_info   = TECNICOS.get(cod_tec, {})
-    valor_hora = TABELA_HORA.get(tec_info.get("nivel", "Técnico Um"), 50)
-    km_rodado  = max(0.0, km_f - km_i)
-    horas_munck  = max(0.0, m_f - m_i)
-
-    # ── Tempo fixo por componente (se aplicável) ──
-    tabela_tempos, _ = carregar_tabela_tempos()
-    equip_fixo = st.session_state.get("_pr_equip_fixo", NENHUM_COMPONENTE)
-    comp_fixo  = st.session_state.get("_pr_componente_fixo", NENHUM_COMPONENTE)
-    tempo_fixo_aplicado = (equip_fixo != NENHUM_COMPONENTE and comp_fixo != NENHUM_COMPONENTE)
-
-    if tempo_fixo_aplicado:
-        horas_trab = tabela_tempos.get((equip_fixo, comp_fixo), 0.0)
-    else:
-        horas_trab = (datetime.combine(date.today(), h_c) -
-                      datetime.combine(date.today(), h_s)).seconds / 3600
-
-    est = calcular_comissao_os(
-        local_servico=local,
-        horas_trabalhadas=horas_trab,
-        valor_hora=valor_hora,
-        km_rodado=km_rodado,
-        tipo_km=tec_info.get("tipo_km", "Km Um"),
-        horas_munck=horas_munck,
-    )
-    return est, horas_trab, km_rodado, horas_munck, tempo_fixo_aplicado
+    A escolha é por PERFIL, não por dispositivo: o Streamlit não informa
+    ao servidor de forma confiável se é celular ou PC, e detectar por
+    largura de tela quebra ao redimensionar. Como o admin é justamente
+    quem só usa PC, a regra por perfil resolve sem gambiarra.
+    """
+    ud = st.session_state["user_data"]
+    if ud["perfil"] == "admin":
+        return _nav_sidebar(ud)
+    return _nav_topo(ud)
 
 # ─────────────────────────────────────────────
-#  FORMULÁRIO DE SERVIÇO
-#  (um técnico adicionando seu trabalho a uma OS)
+#  FORMULÁRIO DE LANÇAMENTO
+#  (o técnico registra um SERVIÇO ou um DESLOCAMENTO numa OS)
 # ─────────────────────────────────────────────
+
+def _hhmm(t) -> str:
+    return t.strftime("%H:%M") if hasattr(t, "strftime") else str(t)
+
+
+def _pt(v, default):
+    """Converte string 'HH:MM' de volta para time, para reabrir em edição."""
+    if isinstance(v, time):
+        return v
+    if isinstance(v, str) and v:
+        try:
+            p = v.split(":")
+            return time(int(p[0]), int(p[1]))
+        except (ValueError, IndexError):
+            return default
+    return default
+
+
+def _limpar_form():
+    for k in list(st.session_state.keys()):
+        if k.startswith("_pr_"):
+            st.session_state.pop(k, None)
+    st.session_state["_pr_reset"] = True
+
+
+def _cabecalho_os(os_item, texto_seq):
+    st.markdown(f"""
+    <div class="nova-os-banner">
+        📋 <strong>{os_item['numero_os']}</strong> &nbsp;·&nbsp;
+        {"Frota <strong>" + str(os_item['frota']) + "</strong> &nbsp;·&nbsp; " if os_item.get('frota') else ""}
+        {os_item.get('equipamento','—')} &nbsp;·&nbsp;
+        {os_item.get('cliente','—')} &nbsp;·&nbsp;
+        {texto_seq}
+    </div>
+    """, unsafe_allow_html=True)
+
 
 def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
     """
-    Renderiza o formulário de serviço.
-    - os_item:        OS pai (dict completo)
-    - serv_existente: se não None, estamos editando um serviço já salvo
-    Retorna o dict do serviço salvo, ou None se ainda não submetido.
+    Renderiza o formulário de lançamento e devolve o dict salvo, ou None.
+
+    A natureza (serviço ou deslocamento) é escolhida no topo. Numa OS
+    aberta como deslocamento puro, só o deslocamento fica disponível —
+    ela não tem frota nem local de serviço.
     """
     editando   = serv_existente is not None
     e          = serv_existente or {}
     eh_tecnico = ud["perfil"] == "tecnico"
 
-    # Inicializa session_state
-    if "_pr_km_ini" not in st.session_state or st.session_state.get("_pr_reset"):
-        def _pt(v, default):
-            if isinstance(v, time): return v
-            if isinstance(v, str):
-                try:
-                    p = v.split(":")
-                    return time(int(p[0]), int(p[1]))
-                except Exception:
-                    return default
-            return default
+    n_lancs   = len(os_item.get("procedimentos", []))
+    seq_atual = e.get("seq", n_lancs + 1)
+    _cabecalho_os(os_item, ("Editando #" + str(seq_atual)) if editando
+                  else f"Novo lançamento (#{seq_atual})")
 
-        st.session_state["_pr_km_ini"]     = float(e.get("km_inicial", 0))
-        st.session_state["_pr_km_fim"]     = float(e.get("km_final",   0))
-        st.session_state["_pr_mun_ini"]    = float(e.get("hora_munck_inicial", 0))
-        st.session_state["_pr_mun_fim"]    = float(e.get("hora_munck_final",   0))
-        st.session_state["_pr_hora_saida"] = _pt(e.get("hora_saida"),   time(7,  30))
-        st.session_state["_pr_hora_cheg"]  = _pt(e.get("hora_chegada"), time(16, 30))
-        st.session_state["_pr_equip_fixo"] = e.get("equipamento_tempo_fixo") or NENHUM_COMPONENTE
-        st.session_state["_pr_reset"] = False
+    # ── Natureza ──
+    os_so_desloc = os_item.get("natureza_os") == "deslocamento"
+    if os_so_desloc:
+        natureza = "deslocamento"
+        st.info("Esta OS foi aberta como **deslocamento** — só aceita lançamentos de deslocamento.")
+    elif editando:
+        natureza = e.get("natureza", "servico")
+        st.caption(f"Natureza: **{LABELS_NATUREZA.get(natureza, natureza)}** "
+                   "(não muda em edição — exclua e lance de novo se precisar trocar)")
+    else:
+        natureza = st.radio(
+            "O que você vai lançar?", list(NATUREZAS), horizontal=True,
+            format_func=lambda n: LABELS_NATUREZA.get(n, n),
+            key="_pr_nat",
+        )
 
-    # Cabeçalho da OS
-    n_servs   = len(os_item.get("procedimentos", []))
-    seq_atual = e.get("seq", n_servs + 1)
-    st.markdown(f"""
-    <div class="nova-os-banner">
-        📋 <strong>{os_item['numero_os']}</strong> &nbsp;·&nbsp;
-        Frota <strong>{os_item['frota']}</strong> &nbsp;·&nbsp;
-        {os_item['equipamento']} &nbsp;·&nbsp;
-        {os_item['cliente']} &nbsp;·&nbsp;
-        {"Editando serviço #" + str(seq_atual) if editando else
-         f"Novo serviço (#{seq_atual})"}
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("---")
 
-    # ── Linha 1 ──
-    c1, c2, c3 = st.columns(3)
+    # ── Dados comuns: data e técnico ──
+    c1, c2 = st.columns(2)
     with c1:
-        data_serv = st.date_input("Data do Serviço",
-            value=date.fromisoformat(e["data"]) if e.get("data") else date.today())
+        data_serv = st.date_input(
+            "Data", value=date.fromisoformat(e["data"]) if e.get("data") else date.today())
+    with c2:
         if eh_tecnico and ud.get("cod_tecnico"):
             cod_tecnico = ud["cod_tecnico"]
             st.text_input("Técnico", value=TECNICOS[cod_tecnico]["nome"], disabled=True)
@@ -502,88 +592,123 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             nomes = list(lista_tec.keys())
             idx = nomes.index(e["nome_tecnico"]) if e.get("nome_tecnico") in nomes else 0
             cod_tecnico = lista_tec[st.selectbox("Técnico", nomes, index=idx)]
-        st.session_state["_pr_cod_tecnico"] = cod_tecnico
 
-    with c2:
+    tec_info = TECNICOS.get(cod_tecnico, {})
+    nivel    = tec_info.get("nivel", "Técnico Um")
+    tipo_km  = tec_info.get("tipo_km", "Km Um")
+
+    if natureza == "deslocamento":
+        return _form_deslocamento(ud, os_item, e, editando,
+                                  data_serv, cod_tecnico, nivel, tipo_km)
+    return _form_servico_normal(ud, os_item, e, editando,
+                                data_serv, cod_tecnico, nivel, tipo_km)
+
+
+# ─────────────────────────────────────────────
+#  SERVIÇO
+# ─────────────────────────────────────────────
+
+def _form_servico_normal(ud, os_item, e, editando, data_serv, cod_tecnico, nivel, tipo_km):
+    eh_tecnico = ud["perfil"] == "tecnico"
+
+    c1, c2 = st.columns(2)
+    with c1:
         idx_tp = TIPOS_SERVICO.index(e["tipo_servico"]) if e.get("tipo_servico") in TIPOS_SERVICO else 0
         tipo_servico = st.selectbox("Tipo de Serviço", TIPOS_SERVICO, index=idx_tp)
-        locais = ["interno barracão", "campo", "deslocamento", "m.s"]
-        idx_lc = locais.index(e["local_servico"]) if e.get("local_servico") in locais else 0
-        local_servico = st.selectbox("Local do Serviço", locais, index=idx_lc, key="_pr_local")
+    with c2:
+        locais = list(LOCAIS_OS)
+        padrao = e.get("local_servico") or os_item.get("local_previsto") or locais[0]
+        idx_lc = locais.index(padrao) if padrao in locais else 0
+        local_servico = st.selectbox("Local do Serviço", locais, index=idx_lc,
+                                      format_func=lambda l: LABELS_LOCAIS_OS.get(l, l))
 
-    with c3:
-        # CC herdado da OS — exibe apenas como info, não editável no serviço
-        cc_txt = (f"{os_item['cod_cc']} - {os_item['cliente']}"
-                  if os_item.get("cod_cc") is not None
-                  else f"⚠️ pendente - {os_item.get('cliente','—')}")
-        st.text_input("Centro de Custo", value=cc_txt, disabled=True)
-        st.caption("Herdado da OS — altere na OS se necessário")
+    cc_txt = (f"{os_item['cod_cc']} - {os_item['cliente']}"
+              if os_item.get("cod_cc") is not None
+              else f"⚠️ pendente - {os_item.get('cliente','—')}")
+    st.text_input("Centro de Custo", value=cc_txt, disabled=True)
+    st.caption("Herdado da OS — altere na OS se necessário")
 
     st.markdown("---")
 
-    # ── Tempo Fixo por Componente (opcional) ──
+    # ── Tempo fixo por componente ──
     st.markdown("##### ⏱️ Tempo Fixo por Componente (opcional)")
-    st.caption(
-        "Se este serviço é a troca/reparo de um componente da tabela, o tempo já vem "
-        "pronto da planilha e o campo Hora Saída/Chegada abaixo não é usado no cálculo. "
-        "Se não for um item da tabela, o tempo continua sendo calculado por hora início/fim."
-    )
+    st.caption("Se o serviço é a troca/reparo de um componente da tabela, o tempo já "
+               "vem pronto da planilha e os horários abaixo viram só registro.")
     tabela_tempos, por_equipamento = carregar_tabela_tempos()
 
     if not por_equipamento:
-        st.warning("⚠️ Planilha TEMPO_SERVIÇO.xlsx não encontrada na pasta do app — "
-                    "tempo fixo indisponível, todos os serviços usam hora início/fim.")
-        equip_sel, comp_sel = NENHUM_COMPONENTE, NENHUM_COMPONENTE
+        st.warning("⚠️ TEMPO_SERVIÇO.xlsx não encontrada — tempo fixo indisponível.")
+        equip_sel = comp_sel = NENHUM_COMPONENTE
     else:
         equipamentos_tabela = [NENHUM_COMPONENTE] + sorted(por_equipamento.keys())
         if st.session_state.get("_pr_equip_fixo") not in equipamentos_tabela:
-            st.session_state["_pr_equip_fixo"] = NENHUM_COMPONENTE
-
+            st.session_state["_pr_equip_fixo"] = (
+                e.get("equipamento_tempo_fixo")
+                if e.get("equipamento_tempo_fixo") in equipamentos_tabela
+                else NENHUM_COMPONENTE)
         c_eq, c_comp = st.columns(2)
-        equip_sel = c_eq.selectbox("Equipamento (tabela de tempos)", equipamentos_tabela,
-                                    key="_pr_equip_fixo")
-
-        if equip_sel != NENHUM_COMPONENTE:
-            comps = [NENHUM_COMPONENTE] + por_equipamento.get(equip_sel, [])
-        else:
-            comps = [NENHUM_COMPONENTE]
+        equip_sel = c_eq.selectbox("Equipamento (tabela de tempos)",
+                                    equipamentos_tabela, key="_pr_equip_fixo")
+        comps = ([NENHUM_COMPONENTE] + por_equipamento.get(equip_sel, [])
+                 if equip_sel != NENHUM_COMPONENTE else [NENHUM_COMPONENTE])
         if st.session_state.get("_pr_componente_fixo") not in comps:
             st.session_state["_pr_componente_fixo"] = (
-                e.get("componente_tempo_fixo") if e.get("componente_tempo_fixo") in comps
-                else NENHUM_COMPONENTE
-            )
+                e.get("componente_tempo_fixo")
+                if e.get("componente_tempo_fixo") in comps else NENHUM_COMPONENTE)
         comp_sel = c_comp.selectbox("Componente", comps, key="_pr_componente_fixo",
                                      disabled=(equip_sel == NENHUM_COMPONENTE))
 
-        if equip_sel != NENHUM_COMPONENTE and comp_sel != NENHUM_COMPONENTE:
-            horas_fixas = tabela_tempos.get((equip_sel, comp_sel), 0.0)
-            st.markdown(f"""
-            <div class="tempo-fixo-box">
-                ⏱️ <strong>Tempo fixo aplicado: {horas_fixas:.2f}h ({formatar_horas(horas_fixas)})</strong><br>
-                Hora Saída/Chegada abaixo servem apenas de registro — não entram no cálculo.
-            </div>
-            """, unsafe_allow_html=True)
+    tempo_fixo = (equip_sel != NENHUM_COMPONENTE and comp_sel != NENHUM_COMPONENTE)
+    horas_fixas = tabela_tempos.get((equip_sel, comp_sel), 0.0) if tempo_fixo else None
+    if tempo_fixo:
+        st.markdown(f"""
+        <div class="tempo-fixo-box">
+            ⏱️ <strong>Tempo fixo: {horas_fixas:.2f}h ({formatar_horas(horas_fixas)})</strong><br>
+            Não há desconto de intervalo — o tempo da planilha já é o de execução.
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Linha 2 ──
+    # ── Horários, KM e Munck ──
     c4, c5 = st.columns(2)
     with c4:
-        hora_saida   = st.time_input("Hora Saída",   key="_pr_hora_saida")
-        hora_chegada = st.time_input("Hora Chegada", key="_pr_hora_cheg")
+        hora_saida = st.time_input("Hora Saída",
+            value=_pt(e.get("hora_saida"), time(7, 30)), key="_pr_hora_saida")
+        hora_chegada = st.time_input("Hora Chegada",
+            value=_pt(e.get("hora_chegada"), time(17, 0)), key="_pr_hora_cheg")
     with c5:
-        km_ini  = st.number_input("KM Inicial",        min_value=0.0, step=1.0,  format="%.1f", key="_pr_km_ini")
-        km_fim  = st.number_input("KM Final",           min_value=0.0, step=1.0,  format="%.1f", key="_pr_km_fim")
-        mun_ini = st.number_input("Hora Munck Inicial", min_value=0.0, step=0.1,  format="%.2f", key="_pr_mun_ini")
-        mun_fim = st.number_input("Hora Munck Final",   min_value=0.0, step=0.1,  format="%.2f", key="_pr_mun_fim")
+        km_ini = st.number_input("KM Inicial", min_value=0.0, step=1.0, format="%.1f",
+                                  value=float(e.get("km_inicial", 0)), key="_pr_km_ini")
+        km_fim = st.number_input("KM Final", min_value=0.0, step=1.0, format="%.1f",
+                                  value=float(e.get("km_final", 0)), key="_pr_km_fim")
+        mun_ini = st.number_input("Hora Munck Inicial", min_value=0.0, step=0.1, format="%.2f",
+                                   value=float(e.get("hora_munck_inicial", 0)), key="_pr_mun_ini")
+        mun_fim = st.number_input("Hora Munck Final", min_value=0.0, step=0.1, format="%.2f",
+                                   value=float(e.get("hora_munck_final", 0)), key="_pr_mun_fim")
 
     descricao = st.text_area("Descrição do Serviço Executado",
         value=e.get("descricao", ""), height=100,
         placeholder="Descreva detalhadamente o serviço realizado...")
 
-    # ── Preview ──
+    km_rodado   = max(0.0, km_fim - km_ini)
+    horas_munck = max(0.0, mun_fim - mun_ini)
+
+    calc = calcular_servico(
+        local_servico=local_servico, nivel_tecnico=nivel,
+        hora_saida=hora_saida, hora_chegada=hora_chegada,
+        horas_trabalhadas=horas_fixas if tempo_fixo else None,
+        km_rodado=km_rodado, tipo_km=tipo_km, horas_munck=horas_munck,
+    )
+
     st.markdown("---")
-    comissao_est, horas_trab, km_rodado, horas_munck, tempo_fixo_aplicado = _recalc_preview()
+    if calc["intervalo_maior_que_jornada"]:
+        st.error("⚠️ O intervalo padrão (1h12 de almoço + 15min de café) é maior que a "
+                 "jornada informada. Confira os horários.")
+    elif calc["intervalo"] > 0:
+        st.caption(f"ℹ️ Atravessa o meio-dia: descontados {calc['intervalo']:.2f}h de "
+                   f"intervalo ({calc['horas_brutas']:.2f}h brutas → "
+                   f"{calc['horas_trabalhadas']:.2f}h trabalhadas).")
 
     if eh_tecnico:
         st.markdown(f"""
@@ -591,8 +716,9 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             <div class="title">📊 Resumo</div>
             <div class="preview-grid-2">
                 <div class="preview-item">
-                    <div class="lbl">{"Horas (tempo fixo)" if tempo_fixo_aplicado else "Horas Trabalhadas"}</div>
-                    <div class="val">{horas_trab:.2f}h</div>
+                    <div class="lbl">{"Horas (tempo fixo)" if tempo_fixo else "Horas Trabalhadas"}</div>
+                    <div class="val">{calc['horas_trabalhadas']:.2f}h</div>
+                    <div class="sub">{f"bruto {calc['horas_brutas']:.2f}h" if calc['intervalo'] else ""}</div>
                 </div>
                 <div class="preview-item">
                     <div class="lbl">KM Rodado</div>
@@ -604,57 +730,58 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
     else:
         st.markdown(f"""
         <div class="preview-box">
-            <div class="title">📊 Preview da Comissão</div>
+            <div class="title">📊 Preview</div>
             <div class="preview-grid">
                 <div class="preview-item">
-                    <div class="lbl">{"Horas (fixo)" if tempo_fixo_aplicado else "Horas"}</div>
-                    <div class="val">{horas_trab:.2f}h</div>
-                </div>
-                <div class="preview-item">
-                    <div class="lbl">KM Rodado</div>
-                    <div class="val">{km_rodado:.1f} km</div>
-                    <div class="sub">{km_ini:.1f} → {km_fim:.1f}</div>
+                    <div class="lbl">Horas</div>
+                    <div class="val">{calc['horas_trabalhadas']:.2f}h</div>
+                    <div class="sub">R$ {calc['valor_hora']:.0f}/h</div>
                 </div>
                 <div class="preview-item">
                     <div class="lbl">Valor Serviço</div>
-                    <div class="val">R$ {comissao_est['valor_servico']:,.2f}</div>
-                    <div class="sub">+ KM R$ {comissao_est['valor_km']:,.2f}</div>
+                    <div class="val">R$ {calc['valor_servico']:,.2f}</div>
+                    <div class="sub">base da comissão</div>
                 </div>
                 <div class="preview-item">
-                    <div class="lbl">Comissão ({comissao_est['percentual']}%)</div>
-                    <div class="val" style="color:#4ade80;">R$ {comissao_est['comissao']:,.2f}</div>
-                    <div class="sub">Local: {local_servico}</div>
+                    <div class="lbl">Total Cobrado</div>
+                    <div class="val">R$ {calc['valor_total']:,.2f}</div>
+                    <div class="sub">+ KM R$ {calc['valor_km']:,.2f}</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Comissão ({calc['percentual']:.0f}%)</div>
+                    <div class="val" style="color:#4ade80;">R$ {calc['comissao']:,.2f}</div>
+                    <div class="sub">{local_servico}</div>
                 </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
+        st.caption("A comissão incide só sobre o valor das horas — KM e Munck ficam fora da base.")
 
-    # ── Botão salvar ──
-    label_btn = "💾 Salvar Alterações" if editando else "💾 Salvar Serviço"
-    if st.button(label_btn, type="primary", use_container_width=True):
+    if st.button("💾 Salvar Alterações" if editando else "💾 Salvar Serviço",
+                 type="primary", use_container_width=True):
         if not descricao.strip():
             st.error("A descrição do serviço é obrigatória.")
             return None
-        if horas_trab <= 0:
-            if tempo_fixo_aplicado:
-                st.error("Não foi possível obter o tempo fixo para este componente.")
-            else:
-                st.error("Hora chegada deve ser posterior à hora saída.")
+        if calc["horas_trabalhadas"] <= 0:
+            st.error("Tempo de serviço inválido. Confira os horários ou o componente.")
             return None
 
         serv = {
+            "natureza":            "servico",
             "data":                str(data_serv),
             "cod_tecnico":         cod_tecnico,
             "nome_tecnico":        TECNICOS[cod_tecnico]["nome"],
-            "nivel_tecnico":       TECNICOS[cod_tecnico]["nivel"],
+            "nivel_tecnico":       nivel,
             "tipo_servico":        tipo_servico,
             "local_servico":       local_servico,
-            "hora_saida":          str(hora_saida),
-            "hora_chegada":        str(hora_chegada),
-            "horas_trabalhadas":   round(horas_trab, 4),
+            "hora_saida":          _hhmm(hora_saida),
+            "hora_chegada":        _hhmm(hora_chegada),
+            "horas_brutas":        calc["horas_brutas"],
+            "intervalo":           calc["intervalo"],
+            "horas_trabalhadas":   calc["horas_trabalhadas"],
             "equipamento_tempo_fixo": equip_sel if equip_sel != NENHUM_COMPONENTE else None,
             "componente_tempo_fixo":  comp_sel  if comp_sel  != NENHUM_COMPONENTE else None,
-            "tempo_fixo_aplicado":    tempo_fixo_aplicado,
+            "tempo_fixo_aplicado":    tempo_fixo,
             "km_inicial":          km_ini,
             "km_final":            km_fim,
             "km_rodado":           round(km_rodado, 2),
@@ -662,72 +789,264 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
             "hora_munck_final":    mun_fim,
             "horas_munck":         round(horas_munck, 4),
             "descricao":           descricao,
-            "valor_servico":       round(comissao_est["valor_servico"], 2),
-            "comissao":            round(comissao_est["comissao"], 2),
-            "percentual_comissao": comissao_est["percentual"],
-            "valor_km":            round(comissao_est.get("valor_km", 0), 2),
-            "valor_munck":         round(comissao_est.get("valor_munck", 0), 2),
+            "valor_hora":          calc["valor_hora"],
+            "valor_servico":       round(calc["valor_servico"], 2),
+            "valor_km":            round(calc["valor_km"], 2),
+            "valor_munck":         round(calc["valor_munck"], 2),
+            "valor_deslocamento":  0.0,
+            "valor_total":         round(calc["valor_total"], 2),
+            "base_comissao":       round(calc["base_comissao"], 2),
+            "percentual_comissao": calc["percentual"],
+            "comissao":            round(calc["comissao"], 2),
             "registrado_por":      st.session_state["usuario"],
             "registrado_em":       datetime.now().isoformat(),
             "editado_por":         None,
             "editado_em":          None,
         }
-
-        if editando:
-            serv["editado_por"]    = st.session_state["usuario"]
-            serv["editado_em"]     = datetime.now().isoformat()
-            serv["registrado_por"] = e.get("registrado_por", st.session_state["usuario"])
-            serv["registrado_em"]  = e.get("registrado_em",  datetime.now().isoformat())
-            ok = editar_servico(os_item["numero_os"], e["proc_id"], serv)
-            if not ok:
-                st.error("Não foi possível editar. OS pode ter sido enviada para aprovação.")
-                return None
-        else:
-            ok = adicionar_servico(os_item["numero_os"], serv)
-            if not ok:
-                st.error("Não foi possível adicionar serviço. Verifique o status da OS.")
-                return None
-
-        # Limpa session_state do form
-        for k in ["_pr_km_ini","_pr_km_fim","_pr_mun_ini","_pr_mun_fim",
-                  "_pr_hora_saida","_pr_hora_cheg","_pr_cod_tecnico","_pr_local",
-                  "_pr_equip_fixo","_pr_componente_fixo"]:
-            st.session_state.pop(k, None)
-        st.session_state["_pr_reset"] = True
-        return serv
+        return _persistir(os_item, e, serv, editando)
     return None
 
+
 # ─────────────────────────────────────────────
-#  COMPONENTE: timeline de serviços de uma OS
+#  DESLOCAMENTO
+# ─────────────────────────────────────────────
+
+def _form_deslocamento(ud, os_item, e, editando, data_serv, cod_tecnico, nivel, tipo_km):
+    eh_tecnico = ud["perfil"] == "tecnico"
+
+    st.markdown("##### 📍 Trajeto")
+    c1, c2 = st.columns(2)
+    with c1:
+        cidade_origem = campo_cidade("Cidade de Origem", "_pr_cid_orig",
+                                      e.get("cidade_origem", ""))
+    with c2:
+        cidade_destino = campo_cidade("Cidade de Destino", "_pr_cid_dest",
+                                       e.get("cidade_destino", ""))
+
+    st.markdown("---")
+    st.markdown("##### 🕐 Horários")
+    st.caption("Ida e retorno são lançados separados, como na planilha. "
+               "Trajeto não desconta almoço.")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Ida**")
+        ida_sai = st.time_input("Saída (ida)",
+            value=_pt(e.get("ida_saida"), time(6, 0)), key="_pr_ida_sai")
+        ida_cheg = st.time_input("Chegada (ida)",
+            value=_pt(e.get("ida_chegada"), time(10, 0)), key="_pr_ida_cheg")
+    with c4:
+        st.markdown("**Retorno**")
+        ret_sai = st.time_input("Saída (retorno)",
+            value=_pt(e.get("retorno_saida"), time(16, 0)), key="_pr_ret_sai")
+        ret_cheg = st.time_input("Chegada (retorno)",
+            value=_pt(e.get("retorno_chegada"), time(20, 0)), key="_pr_ret_cheg")
+
+    st.markdown("---")
+    st.markdown("##### 🛣️ Quilometragem")
+    c5, c6 = st.columns(2)
+    with c5:
+        km_ini = st.number_input("KM Inicial", min_value=0.0, step=1.0, format="%.1f",
+                                  value=float(e.get("km_inicial", 0)), key="_pr_km_ini")
+    with c6:
+        km_fim = st.number_input("KM Final", min_value=0.0, step=1.0, format="%.1f",
+                                  value=float(e.get("km_final", 0)), key="_pr_km_fim")
+
+    descricao = st.text_area("Observação (opcional)", value=e.get("descricao", ""),
+        height=80, placeholder="Motivo do deslocamento, ocorrências no trajeto...")
+
+    km_rodado = max(0.0, km_fim - km_ini)
+    calc = calcular_deslocamento(
+        ida_saida=ida_sai, ida_chegada=ida_cheg,
+        retorno_saida=ret_sai, retorno_chegada=ret_cheg,
+        km_rodado=km_rodado, tipo_km=tipo_km,
+    )
+
+    st.markdown("---")
+
+    # Velocidade média — conferência de digitação
+    vm = calc["velocidade_media"]
+    if calc["horas_trabalhadas"] > 0 and km_rodado > 0:
+        if vm > 110:
+            st.error(f"⚠️ Velocidade média de {vm:.0f} km/h. Confira os horários ou o KM.")
+        elif vm < 20:
+            st.warning(f"⚠️ Velocidade média de {vm:.0f} km/h — baixa para um trajeto. "
+                       "Confira os horários ou o KM.")
+
+    if eh_tecnico:
+        st.markdown(f"""
+        <div class="preview-box">
+            <div class="title">📊 Resumo do Deslocamento</div>
+            <div class="preview-grid">
+                <div class="preview-item">
+                    <div class="lbl">Ida</div><div class="val">{calc['horas_ida']:.2f}h</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Retorno</div><div class="val">{calc['horas_retorno']:.2f}h</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Total</div><div class="val">{calc['horas_trabalhadas']:.2f}h</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Velocidade Média</div>
+                    <div class="val">{vm:.0f}</div><div class="sub">km/h</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="preview-box">
+            <div class="title">📊 Preview do Deslocamento</div>
+            <div class="preview-grid">
+                <div class="preview-item">
+                    <div class="lbl">Horas de Trajeto</div>
+                    <div class="val">{calc['horas_trabalhadas']:.2f}h</div>
+                    <div class="sub">ida {calc['horas_ida']:.2f}h + volta {calc['horas_retorno']:.2f}h</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Valor Deslocamento</div>
+                    <div class="val">R$ {calc['valor_deslocamento']:,.2f}</div>
+                    <div class="sub">R$ 60/h fixo</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Velocidade Média</div>
+                    <div class="val">{vm:.0f}</div>
+                    <div class="sub">{km_rodado:.0f} km</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Comissão (6%)</div>
+                    <div class="val" style="color:#4ade80;">R$ {calc['comissao']:,.2f}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if st.button("💾 Salvar Alterações" if editando else "💾 Salvar Deslocamento",
+                 type="primary", use_container_width=True):
+        if not cidade_origem or not cidade_destino:
+            st.error("Informe a cidade de origem e a de destino.")
+            return None
+        if calc["horas_trabalhadas"] <= 0:
+            st.error("Horários inválidos — a chegada deve ser posterior à saída "
+                     "em pelo menos um dos trajetos.")
+            return None
+
+        desl = {
+            "natureza":            "deslocamento",
+            "data":                str(data_serv),
+            "cod_tecnico":         cod_tecnico,
+            "nome_tecnico":        TECNICOS[cod_tecnico]["nome"],
+            "nivel_tecnico":       nivel,
+            "tipo_servico":        "Deslocamento",
+            "local_servico":       "",
+            "cidade_origem":       cidade_origem,
+            "cidade_destino":      cidade_destino,
+            "ida_saida":           _hhmm(ida_sai),
+            "ida_chegada":         _hhmm(ida_cheg),
+            "retorno_saida":       _hhmm(ret_sai),
+            "retorno_chegada":     _hhmm(ret_cheg),
+            "horas_ida":           calc["horas_ida"],
+            "horas_retorno":       calc["horas_retorno"],
+            "horas_trabalhadas":   calc["horas_trabalhadas"],
+            "km_inicial":          km_ini,
+            "km_final":            km_fim,
+            "km_rodado":           round(km_rodado, 2),
+            "velocidade_media":    vm,
+            "descricao":           descricao,
+            "valor_hora":          calc["valor_hora"],
+            "valor_servico":       0.0,
+            "valor_km":            round(calc["valor_km"], 2),
+            "valor_munck":         0.0,
+            "valor_deslocamento":  round(calc["valor_deslocamento"], 2),
+            "valor_total":         round(calc["valor_total"], 2),
+            "base_comissao":       round(calc["base_comissao"], 2),
+            "percentual_comissao": calc["percentual"],
+            "comissao":            round(calc["comissao"], 2),
+            "registrado_por":      st.session_state["usuario"],
+            "registrado_em":       datetime.now().isoformat(),
+            "editado_por":         None,
+            "editado_em":          None,
+        }
+        return _persistir(os_item, e, desl, editando)
+    return None
+
+
+def _persistir(os_item, e, registro, editando):
+    """Grava o lançamento (novo ou editado) e limpa o formulário."""
+    if editando:
+        registro["editado_por"]    = st.session_state["usuario"]
+        registro["editado_em"]     = datetime.now().isoformat()
+        registro["registrado_por"] = e.get("registrado_por", st.session_state["usuario"])
+        registro["registrado_em"]  = e.get("registrado_em", datetime.now().isoformat())
+        ok = editar_servico(os_item["numero_os"], e["proc_id"], registro)
+        if not ok:
+            st.error("Não foi possível editar. A OS pode já ter sido enviada para aprovação.")
+            return None
+    else:
+        ok = adicionar_servico(os_item["numero_os"], registro)
+        if not ok:
+            st.error("Não foi possível adicionar. Verifique o status da OS.")
+            return None
+
+    _limpar_form()
+    return registro
+
+# ─────────────────────────────────────────────
+#  COMPONENTE: timeline de lançamentos de uma OS
 # ─────────────────────────────────────────────
 
 def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
-    servs = os_item.get("procedimentos", [])
-    if not servs:
-        st.info("Nenhum serviço registrado ainda.")
+    lancs = os_item.get("procedimentos", [])
+    if not lancs:
+        st.info("Nenhum lançamento registrado ainda.")
         return
 
     eh_tecnico = ud["perfil"] == "tecnico"
 
-    for p in servs:
-        tempo_fixo_txt = ""
-        if p.get("tempo_fixo_aplicado"):
-            tempo_fixo_txt = (
-                f" &nbsp;·&nbsp; ⏱️ Tempo fixo: <strong>{p.get('componente_tempo_fixo','?')}</strong>"
+    for p in lancs:
+        eh_desloc = p.get("natureza") == "deslocamento"
+
+        if eh_desloc:
+            titulo  = "🚚 Deslocamento"
+            sub     = (f"{p.get('cidade_origem','?')} → {p.get('cidade_destino','?')}"
+                       f" &nbsp;·&nbsp; {p.get('data','?')}")
+            detalhe = (
+                f"<strong>Ida:</strong> {p.get('ida_saida','?')} → {p.get('ida_chegada','?')}"
+                f" ({float(p.get('horas_ida',0)):.2f}h)"
+                f" &nbsp;|&nbsp; <strong>Volta:</strong> {p.get('retorno_saida','?')} → "
+                f"{p.get('retorno_chegada','?')} ({float(p.get('horas_retorno',0)):.2f}h)"
+                f"<br><strong>KM:</strong> {float(p.get('km_rodado',0)):.1f} km"
+                f" &nbsp;|&nbsp; <strong>Vel. média:</strong> "
+                f"{float(p.get('velocidade_media',0)):.0f} km/h"
             )
+            borda = "#f59e0b"
+        else:
+            tf = (f" &nbsp;·&nbsp; ⏱️ Tempo fixo: <strong>{p.get('componente_tempo_fixo','?')}</strong>"
+                  if p.get("tempo_fixo_aplicado") else "")
+            titulo  = f"🔧 {p.get('nome_tecnico','?')}"
+            sub     = (f"{p.get('tipo_servico','?')} &nbsp;·&nbsp; "
+                       f"{p.get('local_servico','?')} &nbsp;·&nbsp; {p.get('data','?')}{tf}")
+            intervalo = float(p.get("intervalo", 0) or 0)
+            det_int = (f" (bruto {float(p.get('horas_brutas',0)):.2f}h &minus; "
+                       f"{intervalo:.2f}h de intervalo)" if intervalo else "")
+            detalhe = (
+                f"<strong>Horário:</strong> {p.get('hora_saida','?')} → {p.get('hora_chegada','?')}"
+                f" &nbsp;|&nbsp; <strong>Horas:</strong> "
+                f"{float(p.get('horas_trabalhadas',0)):.2f}h{det_int}"
+                f" &nbsp;|&nbsp; <strong>KM:</strong> {float(p.get('km_rodado',0)):.1f} km"
+            )
+            borda = "#3b82f6"
+
         c_left, c_right = st.columns([3, 1])
         with c_left:
             st.markdown(f"""
-            <div class="serv-card">
-                <div class="serv-seq">Serviço #{p.get('seq','?')}</div>
-                <div class="serv-tec">{p.get('nome_tecnico','?')} <span style="color:#64748b;font-size:0.78rem;">— {p.get('nivel_tecnico','?')}</span></div>
-                <div class="serv-tipo">{p.get('tipo_servico','?')} &nbsp;·&nbsp; {p.get('local_servico','?')} &nbsp;·&nbsp; {p.get('data','?')}{tempo_fixo_txt}</div>
-                <div style="margin-top:0.5rem;font-size:0.82rem;color:#cbd5e1;">
-                    <strong>Horário:</strong> {p.get('hora_saida','?')} → {p.get('hora_chegada','?')}
-                    &nbsp;|&nbsp; <strong>Horas:</strong> {float(p.get('horas_trabalhadas',0)):.2f}h
-                    &nbsp;|&nbsp; <strong>KM:</strong> {float(p.get('km_rodado',0)):.1f} km
-                </div>
-                <div style="margin-top:0.4rem;font-size:0.82rem;color:#94a3b8;">{p.get('descricao','-')}</div>
+            <div class="serv-card" style="border-left-color:{borda};">
+                <div class="serv-seq">Lançamento #{p.get('seq','?')}</div>
+                <div class="serv-tec">{titulo} <span style="color:#64748b;font-size:0.78rem;">— {p.get('nivel_tecnico','?')}</span></div>
+                <div class="serv-tipo">{sub}</div>
+                <div style="margin-top:0.5rem;font-size:0.82rem;color:#cbd5e1;">{detalhe}</div>
+                <div style="margin-top:0.4rem;font-size:0.82rem;color:#94a3b8;">{p.get('descricao','-') or '-'}</div>
                 {"<div style='margin-top:0.3rem;font-size:0.72rem;color:#4a5568;'>✏️ Editado por " + str(p.get('editado_por','')) + " em " + str(p.get('editado_em',''))[:16].replace('T',' ') + "</div>" if p.get('editado_em') else ""}
             </div>
             """, unsafe_allow_html=True)
@@ -741,10 +1060,11 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
                 </div>
                 """, unsafe_allow_html=True)
             else:
+                base = float(p.get("base_comissao", p.get("valor_servico", 0)) or 0)
                 st.markdown(f"""
                 <div class="comissao-box">
-                    <div class="label">Serviço</div>
-                    <div class="valor" style="font-size:1.2rem;">R$ {float(p.get('valor_servico',0)):,.2f}</div>
+                    <div class="label">{"Deslocamento" if eh_desloc else "Serviço"}</div>
+                    <div class="valor" style="font-size:1.2rem;">R$ {base:,.2f}</div>
                     <div style="margin-top:0.4rem;"><span class="info-pill">KM R$ {float(p.get('valor_km',0)):,.2f}</span></div>
                     <div style="margin-top:0.5rem;padding-top:0.5rem;border-top:1px solid #166534;">
                         <div class="label">Comissão ({p.get('percentual_comissao','?')}%)</div>
@@ -753,49 +1073,35 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Botão editar serviço
             if pode_editar:
                 eh_meu = p.get("registrado_por") == st.session_state["usuario"]
-                pode_editar_serv = (
-                    (not eh_tecnico) or    # supervisor/admin pode editar qualquer um
-                    eh_meu                 # técnico só edita o próprio
-                )
-                if pode_editar_serv:
+                if (not eh_tecnico) or eh_meu:
                     bc1, bc2 = st.columns(2) if ud["perfil"] == "admin" else (st.container(), None)
                     with bc1:
-                        if st.button(f"✏️ Editar", key=f"edit_serv_{p.get('proc_id','')}"):
+                        if st.button("✏️ Editar", key=f"edit_serv_{p.get('proc_id','')}"):
                             st.session_state["_editando_serv"] = {
-                                "numero_os": os_item["numero_os"],
-                                "serv":      p,
-                            }
-                            st.session_state["_pr_reset"] = True
+                                "numero_os": os_item["numero_os"], "serv": p}
+                            _limpar_form()
                             st.rerun()
-
-                    # Botão excluir — somente admin
                     if ud["perfil"] == "admin":
-                        confirm_key = f"_confirm_excl_{p.get('proc_id','')}"
+                        ck = f"_confirm_excl_{p.get('proc_id','')}"
                         with bc2:
-                            if st.session_state.get(confirm_key):
+                            if st.session_state.get(ck):
                                 if st.button("✅ Confirmar", key=f"conf_excl_{p.get('proc_id','')}"):
-                                    ok = excluir_servico(
-                                        os_item["numero_os"],
-                                        p.get("proc_id", ""),
-                                        st.session_state["usuario"],
-                                    )
-                                    st.session_state.pop(confirm_key, None)
-                                    if ok:
-                                        st.success("Serviço excluído!")
-                                    else:
-                                        st.error("Não foi possível excluir o serviço.")
+                                    ok = excluir_servico(os_item["numero_os"],
+                                                          p.get("proc_id", ""),
+                                                          st.session_state["usuario"])
+                                    st.session_state.pop(ck, None)
+                                    st.success("Lançamento excluído!") if ok else st.error("Não foi possível excluir.")
                                     st.rerun()
                             else:
                                 if st.button("🗑️ Excluir", key=f"del_serv_{p.get('proc_id','')}"):
-                                    st.session_state[confirm_key] = True
+                                    st.session_state[ck] = True
                                     st.rerun()
-                        if st.session_state.get(confirm_key):
-                            st.caption("⚠️ Confirma a exclusão deste serviço? Essa ação não pode ser desfeita.")
-                            if st.button("✖️ Cancelar exclusão", key=f"canc_excl_{p.get('proc_id','')}"):
-                                st.session_state.pop(confirm_key, None)
+                        if st.session_state.get(ck):
+                            st.caption("⚠️ Confirma a exclusão? Não pode ser desfeito.")
+                            if st.button("✖️ Cancelar", key=f"canc_excl_{p.get('proc_id','')}"):
+                                st.session_state.pop(ck, None)
                                 st.rerun()
 
 # ─────────────────────────────────────────────
@@ -809,99 +1115,103 @@ def pagina_abrir_os():
         <span style="font-size:1.3rem">➕</span><h3>Abrir Nova Ordem de Serviço</h3>
     </div>""", unsafe_allow_html=True)
 
-    # Quais tipos este perfil pode abrir (a regra vive no dados.py)
-    tipos_permitidos = [t for t in TIPOS_OS if pode_abrir_os(perfil, t, "manual")]
-    if not tipos_permitidos:
+    # Locais que este perfil pode abrir. O tipo (interna/externa) é
+    # derivado do local — a regra vive no dados.py, não aqui.
+    locais_permitidos = [l for l in LOCAIS_OS
+                         if pode_abrir_os(perfil, tipo_os_do_local(l), "manual")]
+    if not locais_permitidos:
         st.error("Seu perfil não pode abrir OS.")
         return
 
     if perfil == "tecnico":
-        st.info(
-            "Você pode abrir **OS externa** (campo, deslocamento, M.S). "
-            "OS interna é aberta pelo supervisor, ou automaticamente pelo "
-            "app de Checklist de Veículos."
-        )
-    else:
-        st.info("Informe os dados do equipamento. Os técnicos adicionarão os serviços depois.")
+        st.info("Você pode abrir OS de **campo**, **M.S** e de **deslocamento**. "
+                "OS interna (barracão) é aberta pelo supervisor, ou automaticamente "
+                "pelo app de Checklist de Veículos.")
 
     FROTAS = carregar_frotas()
 
     # Sem st.form de propósito: dentro de um form o Streamlit não re-executa
     # enquanto se digita, e o Equipamento nunca preencheria a partir da frota.
     with st.container():
-        tipo_os = st.radio(
-            "Tipo de OS", tipos_permitidos, horizontal=True,
-            format_func=lambda t: {
-                "interna": "🏠 Interna (barracão)",
-                "externa": "🚚 Externa (campo / deslocamento / M.S)",
-            }.get(t, t),
+        natureza_os = st.radio(
+            "Tipo de OS", list(NATUREZAS), horizontal=True,
+            format_func=lambda n: {"servico": "🔧 Serviço (com frota)",
+                                    "deslocamento": "🚚 Deslocamento (sem frota)"}.get(n, n),
+            key="_os_nat",
         )
+        eh_desloc_os = natureza_os == "deslocamento"
+
+        if eh_desloc_os:
+            st.caption("OS de deslocamento não tem frota nem local de serviço — só "
+                       "centro de custo. Os trajetos são lançados depois.")
+            local_previsto = ""
+        else:
+            local_previsto = st.radio(
+                "Local do Serviço", locais_permitidos, horizontal=True,
+                format_func=lambda l: LABELS_LOCAIS_OS.get(l, l), key="_os_local")
 
         c1, c2 = st.columns(2)
         with c1:
-            data_ab   = st.date_input("Data de Abertura", value=date.today())
-            frota_val = st.text_input("Frota", placeholder="Ex: 1201", key="_os_frota")
+            data_ab = st.date_input("Data de Abertura", value=date.today())
+            frota_val = ("" if eh_desloc_os else
+                         st.text_input("Frota", placeholder="Ex: 1201", key="_os_frota"))
         with c2:
             lista_cc = {f"{k} - {v}": k for k, v in CENTROS_CUSTO.items()}
-            ccs = list(lista_cc.keys())
-            cod_cc = lista_cc[st.selectbox("Centro de Custo / Cliente", ccs)]
+            cod_cc = lista_cc[st.selectbox("Centro de Custo / Cliente", list(lista_cc.keys()))]
 
         frota = (frota_val or "").strip()
         desc_frota = FROTAS.get(frota, "")
 
-        # Só sobrescreve o Equipamento quando a frota MUDA e existe no cadastro.
-        # Assim o que o usuário digitou à mão não é apagado a cada tecla.
-        st.session_state.setdefault("_os_equip", "")
-        if desc_frota and st.session_state.get("_os_frota_ant") != frota:
-            st.session_state["_os_equip"]     = desc_frota
-            st.session_state["_os_frota_ant"] = frota
-
-        equipamento = st.text_input(
-            "Equipamento / Descrição",
-            key="_os_equip",
-            placeholder="Preenchido automaticamente ao digitar a frota",
-        )
-        if frota and not desc_frota:
-            st.caption(f"⚠️ Frota {frota} não encontrada no CADASTRO.xlsx — "
-                       "descreva o equipamento manualmente.")
+        if eh_desloc_os:
+            equipamento = "Deslocamento"
+        else:
+            # Só sobrescreve o Equipamento quando a frota MUDA e existe no
+            # cadastro, para não apagar o que o usuário digitou à mão.
+            st.session_state.setdefault("_os_equip", "")
+            if desc_frota and st.session_state.get("_os_frota_ant") != frota:
+                st.session_state["_os_equip"]     = desc_frota
+                st.session_state["_os_frota_ant"] = frota
+            equipamento = st.text_input(
+                "Equipamento / Descrição", key="_os_equip",
+                placeholder="Preenchido automaticamente ao digitar a frota")
+            if frota and not desc_frota:
+                st.caption(f"⚠️ Frota {frota} não encontrada no CADASTRO.xlsx — "
+                           "descreva o equipamento manualmente.")
 
         avaliacao = st.text_area(
             "Avaliação",
             placeholder=("Descreva o problema apresentado pelo veículo — ex: para-brisa "
                          "trincado, motor com fumaça excessiva, vazamento hidráulico."),
             height=110,
-            help="Obrigatório. É o que orienta quem vai executar o serviço.",
-        )
+            help="Obrigatório. É o que orienta quem vai executar o serviço.")
 
-        # Técnico: mecânico abre para si mesmo; supervisor escolhe.
         if perfil == "tecnico" and ud.get("cod_tecnico"):
             cod_tecnico_sel = ud["cod_tecnico"]
             nome_tec_sel    = TECNICOS[cod_tecnico_sel]["nome"]
             st.text_input("Técnico Responsável", value=nome_tec_sel, disabled=True)
         else:
             lista_tec_nomes = {v["nome"]: k for k, v in TECNICOS.items()}
-            nome_tec_sel = st.selectbox(
-                "Técnico Responsável", list(lista_tec_nomes.keys()),
-                help="Apenas este técnico verá esta OS para lançar serviços e encerrá-la.",
-            )
+            nome_tec_sel = st.selectbox("Técnico Responsável", list(lista_tec_nomes.keys()),
+                help="Apenas este técnico verá esta OS para lançar e encerrá-la.")
             cod_tecnico_sel = lista_tec_nomes[nome_tec_sel]
 
         if st.button("🚀 Abrir OS", type="primary", use_container_width=True):
-            if not frota:
+            if not eh_desloc_os and not frota:
                 st.error("Informe a frota.")
             elif not avaliacao.strip():
-                st.error("Preencha a Avaliação — descreva o problema do veículo.")
+                st.error("Preencha a Avaliação — descreva o motivo da OS.")
             else:
                 try:
                     nova = criar_os(
                         frota=frota,
-                        equipamento=equipamento or desc_frota or frota,
+                        equipamento=equipamento or desc_frota or frota or "Deslocamento",
                         cod_cc=cod_cc,
                         aberto_por=st.session_state["usuario"],
                         data_abertura=str(data_ab),
                         tecnico_designado=cod_tecnico_sel,
                         perfil_usuario=perfil,
-                        tipo_os=tipo_os,
+                        local_previsto=local_previsto,
+                        natureza_os=natureza_os,
                         avaliacao=avaliacao,
                         origem="manual",
                     )
@@ -911,6 +1221,8 @@ def pagina_abrir_os():
 
                 st.success(f"✅ OS **{nova['numero_os']}** criada com sucesso!")
                 st.balloons()
+                rotulo = ("🚚 Deslocamento" if eh_desloc_os
+                          else LABELS_LOCAIS_OS.get(local_previsto, local_previsto))
                 st.markdown(f"""
                 <div style="background:#052e16;border:2px solid #16a34a;border-radius:12px;
                      padding:1.5rem;text-align:center;margin-top:1rem;">
@@ -920,7 +1232,7 @@ def pagina_abrir_os():
                         {nova['numero_os']}
                     </div>
                     <div style="font-size:0.85rem;color:#6ee7b7;margin-top:0.25rem;">
-                        Frota {frota} · {CENTROS_CUSTO[cod_cc]} · OS {tipo_os}
+                        {("Frota " + frota + " · ") if frota else ""}{CENTROS_CUSTO[cod_cc]} · {rotulo}
                     </div>
                     <div style="font-size:0.85rem;color:#6ee7b7;margin-top:0.15rem;">
                         Técnico responsável: {nome_tec_sel}
@@ -1013,7 +1325,9 @@ def pagina_adicionar_servico():
         st.markdown("**Novo Serviço**")
         res = _form_servico(ud, os_item)
         if res:
-            st.success(f"✅ Serviço #{res.get('seq','?')} adicionado à OS {numero_os_sel}!")
+            rotulo_lanc = ("Deslocamento" if res.get("natureza") == "deslocamento"
+                            else "Serviço")
+            st.success(f"✅ {rotulo_lanc} adicionado à OS {numero_os_sel}!")
 
             os_atualizada = buscar_os_por_numero(numero_os_sel)
             if os_atualizada and os_atualizada["status"] == "em_andamento":
@@ -1497,11 +1811,13 @@ def pagina_comissoes():
                 "Técnico":     p.get("nome_tecnico","?"),
                 "Nível":       p.get("nivel_tecnico","?"),
                 "Tipo":        p.get("tipo_servico","?"),
-                "Local":       p.get("local_servico","?"),
+                "Local":       ("deslocamento" if p.get("natureza") == "deslocamento"
+                                else p.get("local_servico","?")),
                 "Cliente":     o.get("cliente","?"),
                 "Horas":       float(p.get("horas_trabalhadas",0)),
                 "KM":          float(p.get("km_rodado",0)),
-                "Vlr Serviço": float(p.get("valor_servico",0)),
+                "Vlr Serviço": float(p.get("base_comissao",
+                                            p.get("valor_servico", 0)) or 0),
                 "% Comissão":  float(p.get("percentual_comissao",0)),
                 "Comissão":    float(p.get("comissao",0)),
             })
@@ -1583,8 +1899,16 @@ def pagina_exportar():
                 "Data Servico":   p.get("data",""),
                 "Tecnico":        p.get("nome_tecnico",""),
                 "Nivel":          p.get("nivel_tecnico",""),
+                "Natureza":       p.get("natureza", "servico"),
                 "Tipo Servico":   p.get("tipo_servico",""),
-                "Local":          p.get("local_servico",""),
+                "Local":          ("deslocamento" if p.get("natureza") == "deslocamento"
+                                    else p.get("local_servico","")),
+                "Cidade Origem":  p.get("cidade_origem",""),
+                "Cidade Destino": p.get("cidade_destino",""),
+                "Vlr Deslocamento": float(p.get("valor_deslocamento",0) or 0),
+                "Velocidade Media": float(p.get("velocidade_media",0) or 0),
+                "Horas Brutas":   float(p.get("horas_brutas",0) or 0),
+                "Intervalo":      float(p.get("intervalo",0) or 0),
                 "Componente Tempo Fixo": p.get("componente_tempo_fixo","") or "",
                 "Tempo Fixo Aplicado":   "Sim" if p.get("tempo_fixo_aplicado") else "Não",
                 "Hora Saida":     p.get("hora_saida",""),

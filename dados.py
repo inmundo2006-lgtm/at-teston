@@ -12,32 +12,30 @@ import requests
 import streamlit as st
 
 # ─────────────────────────────────────────────
-#  TABELAS DE VALORES  (sem alteração)
+#  TABELAS DE VALORES
 # ─────────────────────────────────────────────
+# Fonte única: calculos.py, que espelha a aba "Valores" da planilha.
+# Antes existiam duas cópias (aqui e lá) com valores DIFERENTES — foi
+# assim que a tabela errada (a da aba "Inf.") entrou no sistema e as
+# comissões saíram ~8,6% acima do devido. Não redeclare nada aqui.
 
-TABELA_KM = {
-    "Km Um":   1.70,
-    "Km Dois": 4.10,
-    "Km Três": 5.00,
-}
+from calculos import (
+    TABELA_KM,
+    TABELA_HORA,
+    HORA_DESLOCAMENTO,
+    HORA_MUNCK,
+    PERCENTUAL_DESLOCAMENTO,
+    PERCENTUAIS_LOCAL as _PCT_FRACAO,
+    ALMOCO_PADRAO_H,
+    CAFE_PADRAO_H,
+)
 
-TABELA_HORA = {
-    "Técnico Um":     50,
-    "Técnico Dois":   60,
-    "Técnico Três":   80,
-    "Técnico Quatro": 90,
-    "Técnico Cinco": 100,
-}
+# A UI exibe o percentual como inteiro (4, 8, 10); o cálculo usa fração.
+PERCENTUAIS_LOCAL = {k: round(v * 100) for k, v in _PCT_FRACAO.items()}
 
 HORA_DESLOCAMENTO = 60
 HORA_MUNCK        = 120
 
-PERCENTUAIS_LOCAL = {
-    "interno barracão": 4,
-    "campo":            8,
-    "deslocamento":     6,
-    "m.s":             10,
-}
 
 COMISSAO_DESLOCAMENTO_CAMPO   = 8.0
 COMISSAO_DESLOCAMENTO_INTERNO = 4.0
@@ -79,7 +77,6 @@ TIPOS_SERVICO = [
     "Lavagem/Lubrificação/Abastecimento",
     "Serviços Gerais",
     "Carga/descarga",
-    "Deslocamento",
     "Munck",
     "Prensagem",
     "Assistência",
@@ -129,6 +126,45 @@ ORIGENS_OS = ("manual", "checklist")
 
 # Locais de serviço considerados internos (para consistência de lançamento)
 LOCAIS_INTERNOS = ("interno barracão",)
+
+# Locais de serviço. Deslocamento SAIU daqui: deixou de ser um local e
+# virou uma natureza de lançamento própria (ver NATUREZAS abaixo), com
+# campos e cálculo próprios. O tipo da OS (interna/externa) é DERIVADO
+# do local, não escolhido à parte.
+LOCAIS_OS = ("interno barracão", "campo", "m.s")
+
+LABELS_LOCAIS_OS = {
+    "interno barracão": "🏠 Interna (barracão)",
+    "campo":            "🚜 Campo",
+    "m.s":              "🌎 M.S",
+}
+
+# ─────────────────────────────────────────────
+#  NATUREZA DO LANÇAMENTO
+# ─────────────────────────────────────────────
+# Um lançamento é um SERVIÇO (tem frota, tipo de serviço e local) ou um
+# DESLOCAMENTO (tem cidades de origem/destino, trajeto de ida e de volta,
+# e não tem tipo de serviço). Os dois convivem dentro da mesma OS.
+
+NATUREZAS = ("servico", "deslocamento")
+
+LABELS_NATUREZA = {
+    "servico":      "🔧 Serviço",
+    "deslocamento": "🚚 Deslocamento",
+}
+
+# Uma OS pode ser aberta como deslocamento puro — sem frota, só com
+# centro de custo. Nesse caso só aceita lançamentos de deslocamento.
+NATUREZA_OS_PADRAO = "servico"
+
+
+def tipo_os_do_local(local: str) -> str:
+    """'interno barracão' → 'interna'; qualquer outro local → 'externa'.
+
+    Concentrar a derivação aqui evita que a tela e a persistência discordem
+    sobre o que conta como OS interna.
+    """
+    return "interna" if (local or "").strip().lower() in LOCAIS_INTERNOS else "externa"
 
 
 def pode_abrir_os(perfil: str, tipo_os: str, origem: str = "manual") -> bool:
@@ -492,6 +528,8 @@ def criar_os(frota: str, equipamento: str, cod_cc: int | None,
              *,
              perfil_usuario: str = "admin",
              tipo_os: str = "interna",
+             local_previsto: str = "",
+             natureza_os: str = "servico",
              avaliacao: str = "",
              origem: str = "manual",
              checklist_id: str | None = None,
@@ -511,11 +549,24 @@ def criar_os(frota: str, equipamento: str, cod_cc: int | None,
     cliente_texto: nome do CC quando cod_cc não pôde ser resolvido (deixa a
     OS rastreável em vez de gravar cliente vazio).
     """
+    # OS de deslocamento puro: não tem frota nem local de serviço, e é
+    # sempre externa — ninguém se desloca para o próprio barracão.
+    if natureza_os == "deslocamento":
+        tipo_os        = "externa"
+        local_previsto = ""
+        frota          = (frota or "").strip()
+        if not equipamento:
+            equipamento = "Deslocamento"
+    # Caso normal: o local manda, e o tipo é derivado dele.
+    elif local_previsto:
+        tipo_os = tipo_os_do_local(local_previsto)
+
     if not pode_abrir_os(perfil_usuario, tipo_os, origem):
         raise PermissaoNegada(motivo_bloqueio_abertura(perfil_usuario, tipo_os, origem))
 
     if origem == "checklist":
-        tipo_os = "interna"          # decisão de negócio: checklist é sempre interna
+        tipo_os        = "interna"          # decisão de negócio: checklist é sempre interna
+        local_previsto = "interno barracão"
 
     cliente = CENTROS_CUSTO.get(cod_cc, "") if cod_cc is not None else ""
     if not cliente and cliente_texto:
@@ -530,6 +581,8 @@ def criar_os(frota: str, equipamento: str, cod_cc: int | None,
         "cliente":                     cliente,
         "cc_pendente":                 cod_cc is None,
         "tipo_os":                     tipo_os,
+        "natureza_os":                 natureza_os,
+        "local_previsto":              local_previsto or "",
         "origem":                      origem,
         "checklist_id":                checklist_id,
         "avaliacao":                   (avaliacao or "").strip(),
