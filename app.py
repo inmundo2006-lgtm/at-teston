@@ -525,15 +525,23 @@ def _limpar_form():
 
 
 def _cabecalho_os(os_item, texto_seq):
-    st.markdown(f"""
-    <div class="nova-os-banner">
-        📋 <strong>{os_item['numero_os']}</strong> &nbsp;·&nbsp;
-        {"Frota <strong>" + str(os_item['frota']) + "</strong> &nbsp;·&nbsp; " if os_item.get('frota') else ""}
-        {os_item.get('equipamento','—')} &nbsp;·&nbsp;
-        {os_item.get('cliente','—')} &nbsp;·&nbsp;
-        {texto_seq}
-    </div>
-    """, unsafe_allow_html=True)
+    """
+    Faixa de identificação da OS no topo do formulário.
+
+    Montado numa linha só, sem indentação: com HTML indentado e uma linha
+    condicional para a frota, a OS de deslocamento (que não tem frota)
+    deixava uma linha vazia e o Markdown passava a tratar o resto como
+    bloco de código, mostrando o "&nbsp;" cru na tela.
+    """
+    partes = [f"📋 <strong>{os_item.get('numero_os','—')}</strong>"]
+    if os_item.get("frota"):
+        partes.append(f"Frota <strong>{os_item['frota']}</strong>")
+    partes.append(os_item.get("equipamento") or "—")
+    partes.append(os_item.get("cliente") or "—")
+    partes.append(texto_seq)
+    corpo = " &nbsp;&middot;&nbsp; ".join(p for p in partes if p)
+    st.markdown(f'<div class="nova-os-banner">{corpo}</div>',
+                unsafe_allow_html=True)
 
 
 def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
