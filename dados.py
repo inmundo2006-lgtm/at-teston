@@ -62,6 +62,7 @@ TECNICOS = {
     14: {"nome": "Claudecir",        "funcao": "Mecânico",          "tipo_km": "Km Um",   "nivel": "Técnico Três"},
     15: {"nome": "Rodrigo M.",       "funcao": "Mecânico",          "tipo_km": "Km Um",   "nivel": "Técnico Três"},
     16: {"nome": "José",             "funcao": "Auxiliar",          "tipo_km": "Km Um",   "nivel": "Técnico Um"},
+    17: {"nome": "Luiz",             "funcao": "Lavador",           "tipo_km": "Km Um",   "nivel": "Técnico Um"},
 }
 
 # ─────────────────────────────────────────────
@@ -146,11 +147,12 @@ LABELS_LOCAIS_OS = {
 # DESLOCAMENTO (tem cidades de origem/destino, trajeto de ida e de volta,
 # e não tem tipo de serviço). Os dois convivem dentro da mesma OS.
 
-NATUREZAS = ("servico", "deslocamento")
+NATUREZAS = ("servico", "deslocamento", "lavagem")
 
 LABELS_NATUREZA = {
     "servico":      "🔧 Serviço",
     "deslocamento": "🚚 Deslocamento",
+    "lavagem":      "🧼 Lavagem",
 }
 
 # Uma OS pode ser aberta como deslocamento puro — sem frota, só com
@@ -307,6 +309,7 @@ USUARIOS = {
     "claudecir":    {"nome": "Claudecir",        "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 14},
     "rodrigo.m":    {"nome": "Rodrigo M.",       "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 15},
     "jose":         {"nome": "José",             "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 16},
+    "luiz":         {"nome": "Luiz",             "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 17},
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -701,13 +704,18 @@ def adicionar_procedimento(numero_os: str, proc: dict) -> bool:
 
 def editar_procedimento(numero_os: str, proc_id: str, proc_atualizado: dict) -> bool:
     """
-    Substitui um serviço (por proc_id) numa OS em aberta/em_andamento.
+    Substitui um serviço (por proc_id) numa OS aberta/em_andamento ou
+    aguardando_aprovacao. O status aguardando_aprovacao é liberado para o
+    ajuste de tempo que o adm/supervisor faz na própria tela de validação
+    (quando o alerta de tempo acima da média não se justifica). O controle
+    de acesso é feito na UI (página de validação é só de gestão). A OS
+    permanece em aguardando_aprovacao após o ajuste — não sai da fila.
     Importado pelo app.py como:  editar_procedimento as editar_servico
     """
     sp_id, os_dict = _fetch_by_numero(numero_os)
     if not sp_id:
         return False
-    if os_dict["status"] not in ("aberta", "em_andamento"):
+    if os_dict["status"] not in ("aberta", "em_andamento", "aguardando_aprovacao"):
         return False
     for idx, p in enumerate(os_dict["procedimentos"]):
         if p.get("proc_id") == proc_id:

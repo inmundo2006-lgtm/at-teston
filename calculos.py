@@ -74,6 +74,14 @@ TABELA_HORA = {
 HORA_DESLOCAMENTO = 60.0    # Valores!D8 — fixo, independe do nível
 HORA_MUNCK        = 120.0   # Valores!B6
 
+# Lavagem — valor fixo por tipo de veículo. "Outros" NÃO está aqui: cai na
+# regra de tempo (horas × valor-hora do nível), porque varia demais
+# (colhedora, implemento agrícola, etc.).
+VALOR_LAVAGEM = {
+    "carro":  80.0,
+    "onibus": 250.0,
+}
+
 PERCENTUAIS_LOCAL = {
     "interno barracão": 0.04,
     "campo":            0.08,
@@ -258,6 +266,70 @@ def calcular_deslocamento(
         "velocidade_media":   round(km_rodado / horas, 2) if horas > 0 else 0.0,
         "percentual":         round(PERCENTUAL_DESLOCAMENTO * 100, 2),
         "comissao":           round(comissao, 4),
+    }
+
+
+# ─────────────────────────────────────────────
+#  LAVAGEM
+# ─────────────────────────────────────────────
+
+def calcular_lavagem(
+    tipo_veiculo: str,
+    local_servico: str,
+    nivel_tecnico: str = "Técnico Um",
+    hora_saida=None,
+    hora_chegada=None,
+    horas_trabalhadas: float | None = None,
+) -> dict:
+    """
+    Calcula um lançamento de LAVAGEM.
+
+    Regra de valor:
+      carro  → R$80 fixo
+      onibus → R$250 fixo
+      outros → horas líquidas × valor-hora do nível (mesma conta do serviço,
+               com desconto de almoço/café quando atravessa o meio-dia)
+
+    Comissão: valor × percentual DO LOCAL (mesma tabela por local dos demais
+    lançamentos — Interno 4%, Campo 8%, M.S 10%). KM e Munck não se aplicam.
+    """
+    tv    = (tipo_veiculo or "").strip().lower()
+    local = (local_servico or "").strip().lower()
+
+    if tv in VALOR_LAVAGEM:
+        det = {"horas_brutas": 0.0, "intervalo": 0.0, "horas_liquidas": 0.0,
+               "intervalo_maior_que_jornada": False}
+        valor_hora  = 0.0
+        val_servico = VALOR_LAVAGEM[tv]
+    else:  # "outros" — por tempo
+        if horas_trabalhadas is not None:
+            det = {"horas_brutas": float(horas_trabalhadas), "intervalo": 0.0,
+                   "horas_liquidas": float(horas_trabalhadas),
+                   "intervalo_maior_que_jornada": False}
+        else:
+            det = calcular_horas_liquidas(hora_saida, hora_chegada)
+        valor_hora  = TABELA_HORA.get(nivel_tecnico, TABELA_HORA["Técnico Um"])
+        val_servico = det["horas_liquidas"] * valor_hora
+
+    perc     = PERCENTUAIS_LOCAL.get(local, PERCENTUAIS_LOCAL["interno barracão"])
+    comissao = val_servico * perc
+
+    return {
+        "natureza":          "lavagem",
+        "tipo_veiculo":      tv,
+        "horas_brutas":      det["horas_brutas"],
+        "intervalo":         det["intervalo"],
+        "horas_trabalhadas": det["horas_liquidas"],
+        "intervalo_maior_que_jornada": det["intervalo_maior_que_jornada"],
+        "valor_hora":        valor_hora,
+        "valor_servico":     round(val_servico, 4),
+        "valor_km":          0.0,
+        "valor_munck":       0.0,
+        "valor_deslocamento": 0.0,
+        "valor_total":       round(val_servico, 4),
+        "base_comissao":     round(val_servico, 4),
+        "percentual":        round(perc * 100, 2),
+        "comissao":          round(comissao, 4),
     }
 
 

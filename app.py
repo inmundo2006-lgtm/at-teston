@@ -5,8 +5,9 @@ import hashlib
 import os
 from datetime import date, datetime, time
 
-from calculos import calcular_servico, calcular_deslocamento
+from calculos import calcular_servico, calcular_deslocamento, calcular_lavagem
 from tempos_fixos import carregar_tabela_tempos, formatar_horas, NENHUM_COMPONENTE
+from medias import avaliar_tempo, ranking_acima_media
 from cidades import campo_cidade
 
 # ─────────────────────────────────────────────
@@ -601,6 +602,9 @@ def _form_servico(ud, os_item: dict, serv_existente: dict | None = None):
     if natureza == "deslocamento":
         return _form_deslocamento(ud, os_item, e, editando,
                                   data_serv, cod_tecnico, nivel, tipo_km)
+    if natureza == "lavagem":
+        return _form_lavagem(ud, os_item, e, editando,
+                             data_serv, cod_tecnico, nivel, tipo_km)
     return _form_servico_normal(ud, os_item, e, editando,
                                 data_serv, cod_tecnico, nivel, tipo_km)
 
@@ -767,6 +771,40 @@ def _form_servico_normal(ud, os_item, e, editando, data_serv, cod_tecnico, nivel
             st.error("Tempo de serviço inválido. Confira os horários ou o componente.")
             return None
 
+        # Carimbo do alerta de tempo: avalia o lançamento contra a média
+        # histórica viva e guarda o resultado. "disparou_original" registra a
+        # 1ª versão e NÃO é apagado por uma correção posterior — é o histórico
+        # de alertas do mecânico. "disparou" reflete a versão atual (após ajuste
+        # da gestão). Tempo fixo não é avaliado (não varia).
+        _eh_gestao  = ud["perfil"] in ("admin", "supervisor")
+        _av_carimbo = None if tempo_fixo else avaliar_tempo(
+            tipo_servico, os_item.get("equipamento", ""), calc["horas_trabalhadas"])
+        _ant = e.get("alerta_tempo") if isinstance(e.get("alerta_tempo"), dict) else None
+        if _av_carimbo is None:
+            _alerta_tempo = {"avaliavel": False}
+        else:
+            if editando and _ant and _ant.get("avaliavel"):
+                _orig_disp  = _ant.get("disparou_original", _ant.get("disparou", False))
+                _orig_horas = _ant.get("horas_originais", _ant.get("horas"))
+            else:
+                _orig_disp, _orig_horas = _av_carimbo["acima"], calc["horas_trabalhadas"]
+            _corrig_agora = bool(editando and _eh_gestao and _orig_disp)
+            _ja_corrig    = bool(_ant and _ant.get("corrigido"))
+            _alerta_tempo = {
+                "avaliavel":         True,
+                "disparou":          _av_carimbo["acima"],
+                "disparou_original": bool(_orig_disp),
+                "horas_originais":   round(float(_orig_horas), 2) if _orig_horas is not None else None,
+                "media":             _av_carimbo["media"],
+                "limite":            _av_carimbo["limite"],
+                "excedente_pct":     _av_carimbo["excedente_pct"],
+                "corrigido":         _corrig_agora or _ja_corrig,
+                "corrigido_por":     (st.session_state["usuario"] if _corrig_agora
+                                      else (_ant.get("corrigido_por") if _ant else None)),
+                "corrigido_em":      (datetime.now().isoformat() if _corrig_agora
+                                      else (_ant.get("corrigido_em") if _ant else None)),
+            }
+
         serv = {
             "natureza":            "servico",
             "data":                str(data_serv),
@@ -783,6 +821,7 @@ def _form_servico_normal(ud, os_item, e, editando, data_serv, cod_tecnico, nivel
             "equipamento_tempo_fixo": equip_sel if equip_sel != NENHUM_COMPONENTE else None,
             "componente_tempo_fixo":  comp_sel  if comp_sel  != NENHUM_COMPONENTE else None,
             "tempo_fixo_aplicado":    tempo_fixo,
+            "alerta_tempo":        _alerta_tempo,
             "km_inicial":          km_ini,
             "km_final":            km_fim,
             "km_rodado":           round(km_rodado, 2),
@@ -973,6 +1012,144 @@ def _form_deslocamento(ud, os_item, e, editando, data_serv, cod_tecnico, nivel, 
     return None
 
 
+# ─────────────────────────────────────────────
+#  LAVAGEM
+# ─────────────────────────────────────────────
+
+def _form_lavagem(ud, os_item, e, editando, data_serv, cod_tecnico, nivel, tipo_km):
+    eh_tecnico = ud["perfil"] == "tecnico"
+
+    st.markdown("##### 🧼 Lavagem")
+    TIPOS_VEIC = ["carro", "onibus", "outros"]
+    LBL_VEIC = {"carro": "🚗 Carro (R$80)", "onibus": "🚌 Ônibus (R$250)",
+                "outros": "🚜 Outros (por tempo)"}
+    idx_v = TIPOS_VEIC.index(e.get("tipo_veiculo")) if e.get("tipo_veiculo") in TIPOS_VEIC else 0
+    tipo_veiculo = st.radio("Tipo de veículo", TIPOS_VEIC, index=idx_v, horizontal=True,
+                            format_func=lambda t: LBL_VEIC.get(t, t), key="_pr_lav_veic")
+
+    locais = list(LOCAIS_OS)
+    padrao = e.get("local_servico") or os_item.get("local_previsto") or "interno barracão"
+    idx_lc = locais.index(padrao) if padrao in locais else 0
+    local_servico = st.selectbox("Local", locais, index=idx_lc,
+                                 format_func=lambda l: LABELS_LOCAIS_OS.get(l, l),
+                                 key="_pr_lav_local")
+
+    eh_outros = tipo_veiculo == "outros"
+    hora_saida = hora_chegada = None
+    if eh_outros:
+        st.caption("Outros é medido por horário (horas × valor-hora do nível), com "
+                   "desconto de almoço/café se atravessar o meio-dia.")
+        c4, c5 = st.columns(2)
+        with c4:
+            hora_saida = st.time_input("Hora Saída",
+                value=_pt(e.get("hora_saida"), time(7, 30)), key="_pr_lav_saida")
+        with c5:
+            hora_chegada = st.time_input("Hora Chegada",
+                value=_pt(e.get("hora_chegada"), time(17, 0)), key="_pr_lav_cheg")
+
+    descricao = st.text_area("Descrição / Observação", value=e.get("descricao", ""),
+        height=80, placeholder="Placa, frota, o que foi lavado...")
+
+    calc = calcular_lavagem(
+        tipo_veiculo=tipo_veiculo, local_servico=local_servico,
+        nivel_tecnico=nivel, hora_saida=hora_saida, hora_chegada=hora_chegada,
+    )
+    _veic_nome = {"carro": "Carro", "onibus": "Ônibus"}.get(tipo_veiculo, "Outros")
+
+    st.markdown("---")
+    if eh_outros and calc["intervalo_maior_que_jornada"]:
+        st.error("⚠️ O intervalo padrão (1h12 + 15min) é maior que a jornada. Confira os horários.")
+    elif eh_outros and calc["intervalo"] > 0:
+        st.caption(f"ℹ️ Atravessa o meio-dia: descontados {calc['intervalo']:.2f}h de intervalo.")
+
+    if eh_tecnico:
+        st.markdown(f"""
+        <div class="preview-box">
+            <div class="title">📊 Resumo da Lavagem</div>
+            <div class="preview-grid-2">
+                <div class="preview-item">
+                    <div class="lbl">{"Horas" if eh_outros else "Veículo"}</div>
+                    <div class="val">{(f"{calc['horas_trabalhadas']:.2f}h") if eh_outros else _veic_nome}</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Valor</div>
+                    <div class="val">R$ {calc['valor_servico']:,.2f}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="preview-box">
+            <div class="title">📊 Preview da Lavagem</div>
+            <div class="preview-grid">
+                <div class="preview-item">
+                    <div class="lbl">Veículo</div>
+                    <div class="val" style="font-size:1.05rem;">{_veic_nome}</div>
+                    <div class="sub">{(f"{calc['horas_trabalhadas']:.2f}h × R$ {calc['valor_hora']:.0f}") if eh_outros else "valor fixo"}</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Valor Serviço</div>
+                    <div class="val">R$ {calc['valor_servico']:,.2f}</div>
+                    <div class="sub">base da comissão</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Total Cobrado</div>
+                    <div class="val">R$ {calc['valor_total']:,.2f}</div>
+                </div>
+                <div class="preview-item">
+                    <div class="lbl">Comissão ({calc['percentual']:.0f}%)</div>
+                    <div class="val" style="color:#4ade80;">R$ {calc['comissao']:,.2f}</div>
+                    <div class="sub">{local_servico}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if st.button("💾 Salvar Alterações" if editando else "💾 Salvar Lavagem",
+                 type="primary", use_container_width=True):
+        if not descricao.strip():
+            st.error("Informe uma descrição (placa/frota/o que foi lavado).")
+            return None
+        if eh_outros and calc["horas_trabalhadas"] <= 0:
+            st.error("Horário inválido. Confira a hora de saída e chegada.")
+            return None
+
+        lav = {
+            "natureza":            "lavagem",
+            "tipo_veiculo":        tipo_veiculo,
+            "data":                str(data_serv),
+            "cod_tecnico":         cod_tecnico,
+            "nome_tecnico":        TECNICOS[cod_tecnico]["nome"],
+            "nivel_tecnico":       nivel,
+            "tipo_servico":        "Lavagem",
+            "local_servico":       local_servico,
+            "hora_saida":          _hhmm(hora_saida) if eh_outros else "",
+            "hora_chegada":        _hhmm(hora_chegada) if eh_outros else "",
+            "horas_brutas":        calc["horas_brutas"],
+            "intervalo":           calc["intervalo"],
+            "horas_trabalhadas":   calc["horas_trabalhadas"],
+            "km_rodado":           0.0,
+            "horas_munck":         0.0,
+            "descricao":           descricao,
+            "valor_hora":          calc["valor_hora"],
+            "valor_servico":       round(calc["valor_servico"], 2),
+            "valor_km":            0.0,
+            "valor_munck":         0.0,
+            "valor_deslocamento":  0.0,
+            "valor_total":         round(calc["valor_total"], 2),
+            "base_comissao":       round(calc["base_comissao"], 2),
+            "percentual_comissao": calc["percentual"],
+            "comissao":            round(calc["comissao"], 2),
+            "registrado_por":      st.session_state["usuario"],
+            "registrado_em":       datetime.now().isoformat(),
+            "editado_por":         None,
+            "editado_em":          None,
+        }
+        return _persistir(os_item, e, lav, editando)
+    return None
+
+
 def _persistir(os_item, e, registro, editando):
     """Grava o lançamento (novo ou editado) e limpa o formulário."""
     if editando:
@@ -1006,7 +1183,8 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
     eh_tecnico = ud["perfil"] == "tecnico"
 
     for p in lancs:
-        eh_desloc = p.get("natureza") == "deslocamento"
+        eh_desloc  = p.get("natureza") == "deslocamento"
+        eh_lavagem = p.get("natureza") == "lavagem"
 
         if eh_desloc:
             titulo  = "🚚 Deslocamento"
@@ -1022,6 +1200,23 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
                 f"{float(p.get('velocidade_media',0)):.0f} km/h"
             )
             borda = "#f59e0b"
+        elif eh_lavagem:
+            _vn = {"carro": "Carro", "onibus": "Ônibus"}.get(
+                (p.get("tipo_veiculo") or "").lower(), "Outros")
+            titulo  = f"🧼 {p.get('nome_tecnico','?')}"
+            sub     = (f"Lavagem &nbsp;·&nbsp; {_vn} &nbsp;·&nbsp; "
+                       f"{p.get('local_servico','?')} &nbsp;·&nbsp; {p.get('data','?')}")
+            if (p.get("tipo_veiculo") or "").lower() in ("carro", "onibus"):
+                detalhe = (f"<strong>Veículo:</strong> {_vn}"
+                           f" &nbsp;|&nbsp; <strong>Valor fixo:</strong> "
+                           f"R$ {float(p.get('valor_servico',0)):,.2f}")
+            else:
+                detalhe = (f"<strong>Veículo:</strong> Outros"
+                           f" &nbsp;|&nbsp; <strong>Horário:</strong> "
+                           f"{p.get('hora_saida','?')} → {p.get('hora_chegada','?')}"
+                           f" &nbsp;|&nbsp; <strong>Horas:</strong> "
+                           f"{float(p.get('horas_trabalhadas',0)):.2f}h")
+            borda = "#22d3ee"
         else:
             tf = (f" &nbsp;·&nbsp; ⏱️ Tempo fixo: <strong>{p.get('componente_tempo_fixo','?')}</strong>"
                   if p.get("tempo_fixo_aplicado") else "")
@@ -1051,8 +1246,64 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
                 {"<div style='margin-top:0.3rem;font-size:0.72rem;color:#4a5568;'>✏️ Editado por " + str(p.get('editado_por','')) + " em " + str(p.get('editado_em',''))[:16].replace('T',' ') + "</div>" if p.get('editado_em') else ""}
             </div>
             """, unsafe_allow_html=True)
+            # Alerta de tempo acima da média histórica — só adm/supervisor,
+            # só serviço medido por horário (tempo fixo não varia). Usa o carimbo
+            # gravado no lançamento; se faltar (lançamento antigo), avalia ao vivo.
+            if (not eh_tecnico and not eh_desloc and not eh_lavagem
+                    and not p.get("tempo_fixo_aplicado")):
+                _at = p.get("alerta_tempo") if isinstance(p.get("alerta_tempo"), dict) else None
+                if _at is None or not _at.get("avaliavel", False):
+                    _live = avaliar_tempo(p.get("tipo_servico", ""),
+                                          os_item.get("equipamento", ""),
+                                          float(p.get("horas_trabalhadas", 0) or 0))
+                    _at = ({"avaliavel": True, "disparou": _live["acima"],
+                            "disparou_original": _live["acima"],
+                            "horas_originais": _live["horas"], "media": _live["media"],
+                            "limite": _live["limite"], "excedente_pct": _live["excedente_pct"],
+                            "corrigido": False} if _live else {"avaliavel": False})
+                _horas_atual = float(p.get("horas_trabalhadas", 0) or 0)
+                if _at.get("avaliavel") and _at.get("disparou"):
+                    # Ainda acima da média (valor atual estourou o limite).
+                    st.markdown(f"""
+                    <div style="margin-top:-0.4rem;margin-bottom:0.8rem;padding:0.6rem 0.9rem;
+                                border-radius:8px;background:#3a1d1d;border:1px solid #b91c1c;
+                                border-left:4px solid #ef4444;font-size:0.82rem;color:#fecaca;">
+                        ⚠️ <strong>Tempo acima da média histórica.</strong>
+                        {_horas_atual:.2f}h neste lançamento &nbsp;·&nbsp;
+                        média {_at["media"]:.2f}h &nbsp;·&nbsp;
+                        limite {_at["limite"]:.2f}h (média + 1 desvio)
+                        <br><span style="color:#f87171;font-size:0.75rem;">
+                        Confirme com o mecânico. Se o tempo não se justificar, ajuste o
+                        lançamento no botão Editar — use o tempo real informado, não um
+                        número só para zerar o alerta.
+                        </span>
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif _at.get("avaliavel") and _at.get("disparou_original") and _at.get("corrigido"):
+                    # Estava acima e foi ajustado pela gestão para dentro da faixa.
+                    _ho = _at.get("horas_originais")
+                    _ho_txt = f"{_ho:.2f}h" if isinstance(_ho, (int, float)) else "—"
+                    st.markdown(f"""
+                    <div style="margin-top:-0.4rem;margin-bottom:0.8rem;padding:0.5rem 0.9rem;
+                                border-radius:8px;background:#2a2410;border:1px solid #a16207;
+                                border-left:4px solid #ca8a04;font-size:0.78rem;color:#fde68a;">
+                        ✏️ Estava acima da média ({_ho_txt}) e foi ajustado por
+                        {_at.get("corrigido_por","gestão")} para {_horas_atual:.2f}h
+                        (dentro da faixa, limite {_at["limite"]:.2f}h).
+                    </div>
+                    """, unsafe_allow_html=True)
         with c_right:
-            if eh_tecnico:
+            if eh_tecnico and eh_lavagem:
+                _tv_nome = {"carro": "Carro", "onibus": "Ônibus"}.get(
+                    (p.get("tipo_veiculo") or "").lower(), "Outros")
+                st.markdown(f"""
+                <div class="comissao-box" style="background:linear-gradient(135deg,#0c1a2e,#1e2738);border-color:#3d4a5c;">
+                    <div class="label" style="color:#94a3b8!important;">Lavagem</div>
+                    <div class="valor" style="color:#60a5fa!important;font-size:1.2rem;">R$ {float(p.get('valor_servico',0)):,.2f}</div>
+                    <div style="margin-top:0.5rem;"><span class="info-pill">{_tv_nome}</span></div>
+                </div>
+                """, unsafe_allow_html=True)
+            elif eh_tecnico:
                 st.markdown(f"""
                 <div class="comissao-box" style="background:linear-gradient(135deg,#0c1a2e,#1e2738);border-color:#3d4a5c;">
                     <div class="label" style="color:#94a3b8!important;">Horas</div>
@@ -1064,7 +1315,7 @@ def _render_servicos(os_item: dict, ud: dict, pode_editar: bool = False):
                 base = float(p.get("base_comissao", p.get("valor_servico", 0)) or 0)
                 st.markdown(f"""
                 <div class="comissao-box">
-                    <div class="label">{"Deslocamento" if eh_desloc else "Serviço"}</div>
+                    <div class="label">{"Lavagem" if eh_lavagem else ("Deslocamento" if eh_desloc else "Serviço")}</div>
                     <div class="valor" style="font-size:1.2rem;">R$ {base:,.2f}</div>
                     <div style="margin-top:0.4rem;"><span class="info-pill">KM R$ {float(p.get('valor_km',0)):,.2f}</span></div>
                     <div style="margin-top:0.5rem;padding-top:0.5rem;border-top:1px solid #166534;">
@@ -1135,7 +1386,7 @@ def pagina_abrir_os():
     # enquanto se digita, e o Equipamento nunca preencheria a partir da frota.
     with st.container():
         natureza_os = st.radio(
-            "Tipo de OS", list(NATUREZAS), horizontal=True,
+            "Tipo de OS", ["servico", "deslocamento"], horizontal=True,
             format_func=lambda n: {"servico": "🔧 Serviço (com frota)",
                                     "deslocamento": "🚚 Deslocamento (sem frota)"}.get(n, n),
             key="_os_nat",
@@ -1670,6 +1921,13 @@ def pagina_validacoes():
         <span style="font-size:1.3rem">✅</span><h3>Validação de Ordens de Serviço</h3>
     </div>""", unsafe_allow_html=True)
 
+    # Edição de serviço disparada na própria tela de aprovação (ajuste de
+    # tempo quando o alerta não se justifica): delega o formulário de edição.
+    if st.session_state.get("_editando_serv"):
+        pagina_adicionar_servico()
+        return
+
+    ud_val    = st.session_state["user_data"]
     todas     = carregar_os()
     pendentes = [o for o in todas if o.get("status") == "aguardando_aprovacao"]
 
@@ -1717,7 +1975,10 @@ def pagina_validacoes():
                 """, unsafe_allow_html=True)
 
             st.markdown("**Serviços:**")
-            _render_servicos(os_item, st.session_state["user_data"], pode_editar=False)
+            # Gestão pode ajustar o tempo aqui mesmo (adm e supervisor). A OS
+            # permanece na fila de aprovação após o ajuste.
+            _pode_edit_val = ud_val.get("perfil") in ("admin", "supervisor")
+            _render_servicos(os_item, ud_val, pode_editar=_pode_edit_val)
 
             st.markdown("---")
             col_ok, col_rej, col_obs = st.columns([1, 1, 2])
@@ -1801,6 +2062,33 @@ def pagina_dashboard():
             with c6:
                 st.markdown("**⏱ Horas por Técnico (aprovadas)**")
                 st.bar_chart(df.groupby("Técnico")["Horas"].sum().sort_values())
+
+    # ── Tempo acima da média histórica: ranking por técnico ──
+    st.markdown("---")
+    st.markdown("**⚠️ Tempo acima da média histórica — por técnico (OS aprovadas)**")
+    st.caption("Serviços medidos por horário cujo tempo passou de média + 1 desvio-padrão. "
+               "Tempo fixo e deslocamento não entram. Base: histórico da planilha + aprovados do app.")
+    _rk = ranking_acima_media(todas)
+    if not _rk or all(d["acima"] == 0 for d in _rk):
+        st.info("Nenhum serviço acima da média até agora (ou ainda sem histórico comparável).")
+    else:
+        _rk = [d for d in _rk if d["avaliados"] > 0][:10]
+        _df_rk = pd.DataFrame([{
+            "Técnico":        d["tecnico"],
+            "Acima da média": d["acima"],
+            "Corrigidos":     d["corrigidos"],
+            "Avaliados":      d["avaliados"],
+            "% acima":        f'{d["pct"]:.0f}%',
+        } for d in _rk])
+        _lider = _rk[0]
+        st.markdown(
+            f"<div class='metric-card yellow' style='margin-bottom:0.8rem;'>"
+            f"<div class='metric-label'>Mais lançamentos acima da média</div>"
+            f"<div class='metric-value'>{_lider['tecnico']}</div>"
+            f"<div class='metric-sub'>{_lider['acima']} de {_lider['avaliados']} serviços "
+            f"({_lider['pct']:.0f}%)</div></div>",
+            unsafe_allow_html=True)
+        st.dataframe(_df_rk, use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────
 #  PÁGINA: COMISSÕES
