@@ -209,32 +209,47 @@ def resolver_cod_cc(cc_nome: str) -> tuple[int | None, str]:
     return None, bruto
 
 
-def pode_abrir_os(perfil: str, tipo_os: str, origem: str = "manual") -> bool:
+# Técnicos autorizados NOMINALMENTE a abrir OS interna (barracão).
+# É uma exceção à regra por perfil: técnico fora desta lista não abre interna.
+# Para autorizar outro, basta acrescentar o login aqui.
+TECNICOS_OS_INTERNA = ("belote",)
+
+
+def pode_abrir_os(perfil: str, tipo_os: str, origem: str = "manual",
+                  usuario: str = "") -> bool:
     """
     Regra de permissão de abertura de OS.
 
       - OS vinda do checklist: sempre permitida (é interna por definição).
       - OS externa: técnico, supervisor e admin podem abrir.
-      - OS interna: somente supervisor e admin.
+      - OS interna: supervisor, admin e os técnicos de TECNICOS_OS_INTERNA.
+
+    'usuario' é o login (chave de USUARIOS), não o nome de exibição — a
+    exceção é por pessoa, então o perfil sozinho não basta para decidir.
     """
     if origem == "checklist":
         return True
     if tipo_os == "externa":
         return perfil in ("tecnico", "supervisor", "admin")
     if tipo_os == "interna":
-        return perfil in ("supervisor", "admin")
+        if perfil in ("supervisor", "admin"):
+            return True
+        return (perfil == "tecnico"
+                and (usuario or "").strip().lower() in TECNICOS_OS_INTERNA)
     return False
 
 
-def motivo_bloqueio_abertura(perfil: str, tipo_os: str, origem: str = "manual") -> str:
+def motivo_bloqueio_abertura(perfil: str, tipo_os: str, origem: str = "manual",
+                             usuario: str = "") -> str:
     """Mensagem explicando por que a abertura foi negada (para exibir na UI)."""
     if tipo_os not in TIPOS_OS:
         return f"Tipo de OS inválido: '{tipo_os}'. Use 'interna' ou 'externa'."
     if origem not in ORIGENS_OS:
         return f"Origem de OS inválida: '{origem}'."
     if tipo_os == "interna" and perfil == "tecnico":
-        return ("OS interna só pode ser aberta por supervisor ou administrador. "
-                "Se o veículo passou por checklist, abra a OS pelo app de Checklist.")
+        return ("OS interna (barracão) só pode ser aberta pelo técnico autorizado, "
+                "pelo supervisor ou pelo administrador. Se o veículo passou por "
+                "checklist, abra a OS pelo app de Checklist.")
     return "Seu perfil não tem permissão para abrir esta OS."
 
 # ─────────────────────────────────────────────
@@ -294,7 +309,7 @@ USUARIOS = {
         "cod_tecnico": None,
     },
     "zaqueu":       {"nome": "Zaqueu",           "perfil": "tecnico", "senha": _h("zaqueu123"), "cod_tecnico": 1},
-    "cristiano.b":  {"nome": "Cristiano B.",     "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 2},
+    "belote":       {"nome": "Cristiano B.",     "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 2},
     "rodrigo.j":    {"nome": "Rodrigo J.",       "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 3},
     "marcos.c":     {"nome": "Marcos C.",        "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 4},
     "cristiano.s":  {"nome": "Cristiano dos S.", "perfil": "tecnico", "senha": _h("teston123"), "cod_tecnico": 5},
@@ -604,8 +619,12 @@ def criar_os(frota: str, equipamento: str, cod_cc: int | None,
     elif local_previsto:
         tipo_os = tipo_os_do_local(local_previsto)
 
-    if not pode_abrir_os(perfil_usuario, tipo_os, origem):
-        raise PermissaoNegada(motivo_bloqueio_abertura(perfil_usuario, tipo_os, origem))
+    # aberto_por já é o login de quem está abrindo — a exceção nominal da OS
+    # interna é decidida aqui, e não só na tela (o checklist chama direto).
+    if not pode_abrir_os(perfil_usuario, tipo_os, origem, aberto_por):
+        raise PermissaoNegada(
+            motivo_bloqueio_abertura(perfil_usuario, tipo_os, origem, aberto_por)
+        )
 
     if origem == "checklist":
         tipo_os        = "interna"          # decisão de negócio: checklist é sempre interna

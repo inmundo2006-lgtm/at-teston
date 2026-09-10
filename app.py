@@ -1367,18 +1367,21 @@ def pagina_abrir_os():
         <span style="font-size:1.3rem">➕</span><h3>Abrir Nova Ordem de Serviço</h3>
     </div>""", unsafe_allow_html=True)
 
-    # Locais que este perfil pode abrir. O tipo (interna/externa) é
-    # derivado do local — a regra vive no dados.py, não aqui.
+    # Locais que este usuário pode abrir. O tipo (interna/externa) é
+    # derivado do local — a regra vive no dados.py, não aqui. Passa o login
+    # porque a OS interna tem exceção nominal (TECNICOS_OS_INTERNA).
+    usuario_login = st.session_state["usuario"]
     locais_permitidos = [l for l in LOCAIS_OS
-                         if pode_abrir_os(perfil, tipo_os_do_local(l), "manual")]
+                         if pode_abrir_os(perfil, tipo_os_do_local(l),
+                                          "manual", usuario_login)]
     if not locais_permitidos:
         st.error("Seu perfil não pode abrir OS.")
         return
 
-    if perfil == "tecnico":
+    if perfil == "tecnico" and "interno barracão" not in locais_permitidos:
         st.info("Você pode abrir OS de **campo**, **M.S** e de **deslocamento**. "
-                "OS interna (barracão) é aberta pelo supervisor, ou automaticamente "
-                "pelo app de Checklist de Veículos.")
+                "OS interna (barracão) é aberta pelo técnico autorizado ou pelo "
+                "supervisor, ou automaticamente pelo app de Checklist de Veículos.")
 
     FROTAS = carregar_frotas()
 
